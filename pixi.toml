@@ -1,0 +1,19 @@
+[project]
+authors = ["Christian Mikovits <christian.mikovits@boku.ac.at>"]
+channels = ["conda-forge"]
+description = "Add a short description here"
+name = "LULCTurbines"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+geopandas = ">=1.0.1,<2"
+rasterio = ">=1.4.1,<2"
+odfpy = ">=1.4.1,<2"
+openpyxl = ">=3.1.5,<4"
+tqdm = ">=4.67.1,<5"
+rasterstats = ">=0.20.0,<0.21"
+rioxarray = ">=0.17.0,<0.18"
+dask = ">=2024.11.2,<2025"
