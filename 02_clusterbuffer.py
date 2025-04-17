@@ -328,7 +328,7 @@ def main():
         "unitedkingdom",
     ]  # Add other countries as needed
 
-    datasets = ["new", "all"]
+    datasets = ["new", "all", "old"]
 
     for country in tqdm(countries, desc="Processing Countries"):
         country_output_dir = os.path.join(output_dir, country)
@@ -341,55 +341,37 @@ def main():
         # split_lines = split_lines.explode()  # Ensure multiline geometries are split
 
         for dataset in tqdm(datasets, desc=f"Processing Datasets ({country})", leave=False):
-            # Input turbine points
+            # ------------------------------------------------------------------
+            # 1.  Build full path and make sure the file exists
+            # ------------------------------------------------------------------
             input_file = os.path.join(input_dir, country, f"{country}_{dataset}.gpkg")
             if not os.path.exists(input_file):
                 print(f"[WARNING] File not found: {input_file}")
                 continue
 
-            turbines = gpd.read_file(input_file).to_crs(CRS)
-            turbines = turbines.drop_duplicates(subset="geometry")
+            # ------------------------------------------------------------------
+            # 2.  Read & **skip** empty layers
+            # ------------------------------------------------------------------
+            turbines = gpd.read_file(input_file)  # read whatever layer is first
+            if turbines.empty:  # 👈  new guard‑clause
+                print(f"[INFO] {input_file} contains 0 features – skipping.")
+                continue
 
-            # Process turbines
+            turbines = turbines.to_crs(CRS).drop_duplicates(subset="geometry")
+            # ------------------------------------------------------------------
+            # 3.  …everything below is unchanged …
+            # ------------------------------------------------------------------
             turbines = clustercalculation(turbines)
-            turbines.to_file(
-                os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"),
-                layer="turbines",
-            )
-            # Buffer polygons
+            turbines.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="turbines")
+
             bufferpolys = create_hulls(turbines, "buffer")
+            bufferpolys.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="bufferpolys")
 
-            bufferpolys.to_file(
-                os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"),
-                layer="bufferpolys",
-            )
-
-            # Convex and Concave Hulls with IDs
             convex_hulls = create_hulls(turbines[turbines["cluster"] != -1], "convex")
-
             concave_hulls = create_hulls(turbines[turbines["cluster"] != -1], "concave")
 
-            # Handle splitting and merging slivers for concave polygons
-            # split_concave = split_hulls(concave_hulls, split_lines)
-            # split_concave = assign_tile_best(turbines, split_concave)
-
-            # Merge slivers in concave hulls
-            # merged_concave = merge_slivers(hulls=concave_hulls, slivers=split_concave)
-            concave_hulls.to_file(
-                os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"),
-                layer="concavehulls",
-            )
-
-            # Handle splitting and merging slivers for convex polygons
-            # split_convex = split_hulls(convex_hulls, split_lines)
-            # split_convex = assign_tile_best(turbines, split_convex)
-
-            # Merge slivers in convex hulls
-            # merged_convex = merge_slivers(hulls=convex_hulls, slivers=split_convex)
-            convex_hulls.to_file(
-                os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"),
-                layer="convexhulls",
-            )
+            concave_hulls.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="concavehulls")
+            convex_hulls.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="convexhulls")
 
 
 main()

@@ -75,7 +75,7 @@ def main():
     osmturbines_processed = process_OSMturbines(osmturbines)
 
     # ----------------------------------------------------------------------
-    # 2) Loop for "new" and "all" datasets
+    # 2) Loop for "new" and "all" datasets -> complete_new.gpkg / complete_all.gpkg
     # ----------------------------------------------------------------------
     for dataset_type in ["new", "all"]:
         pattern = os.path.join(turbines_dir, f"**/*{dataset_type}.shp")
@@ -155,10 +155,58 @@ def main():
         combined_gdf.to_file(out_file, driver="GPKG")
 
     # ----------------------------------------------------------------------
-    # 3) Write the final DTU & OSM GPKGs
+    # 3) Write the final DTU & OSM GPKGs for reference
     # ----------------------------------------------------------------------
     dtuturbines_processed.to_file(os.path.join(OUTPUT_DIR, "DTUturbines.gpkg"), driver="GPKG")
     osmturbines_processed.to_file(os.path.join(OUTPUT_DIR, "OSMturbines.gpkg"), driver="GPKG")
+
+    # ----------------------------------------------------------------------
+    # 4) Create the extra dataset: "complete_old.gpkg"
+    #    = all turbines in "complete_all" but EXCLUDING any
+    #      turbine within 250m of a "complete_new" turbine
+    # ----------------------------------------------------------------------
+    # You can customize the distance threshold here:
+    distance_threshold = 250  # meters
+
+    complete_all_path = os.path.join(OUTPUT_DIR, "complete_all.gpkg")
+    complete_new_path = os.path.join(OUTPUT_DIR, "complete_new.gpkg")
+
+    if os.path.exists(complete_all_path) and os.path.exists(complete_new_path):
+        gdf_all = gpd.read_file(complete_all_path)
+        gdf_new = gpd.read_file(complete_new_path)
+
+        if not gdf_all.empty and not gdf_new.empty:
+            # Spatial nearest join: link every turbine in gdf_all to the
+            # closest turbine in gdf_new, only if within 'distance_threshold'.
+            joined = gpd.sjoin_nearest(
+                gdf_all, gdf_new[[gdf_new.geometry.name]], how="left", max_distance=distance_threshold
+            )
+
+            # any row that got matched to a 'new' turbine is within 'distance_threshold'
+            # so we remove it
+            # index_right will be NaN if no match found
+            to_remove = joined[~joined["index_right"].isna()].index
+            gdf_old = joined.loc[~joined.index.isin(to_remove)]
+
+            # Optionally drop any columns from sjoin we no longer need
+            # like 'index_right'
+            columns_to_drop = ["index_right"]
+            for col in columns_to_drop:
+                if col in gdf_old.columns:
+                    gdf_old.drop(columns=[col], inplace=True)
+
+        else:
+            # If one of them is empty, 'old' is basically all of 'all'
+            gdf_old = gdf_all
+
+        out_old = os.path.join(OUTPUT_DIR, "complete_old.gpkg")
+        gdf_old.to_file(out_old, driver="GPKG")
+        print(f"Created an additional dataset: {out_old}")
+    else:
+        print("WARNING: Could not create 'complete_old.gpkg' because one or both:")
+        print("  - complete_all.gpkg")
+        print("  - complete_new.gpkg")
+        print("do not exist.")
 
 
 if __name__ == "__main__":

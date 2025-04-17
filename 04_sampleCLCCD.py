@@ -21,7 +21,7 @@ clc_files = {
 }
 
 # countries = ["france"] #["austria", "france"]
-datasets = ["new", "all"]
+datasets = ["old"]
 
 
 # Function to read raster files and extract their bounds

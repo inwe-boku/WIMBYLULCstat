@@ -30,7 +30,7 @@ countries = [
     "sweden",
     "unitedkingdom",
 ]  # Add other countries as needed
-datasets = ["new", "all"]
+datasets = ["new", "all", "old"]
 input_base_dir = "data/02_outhulls"
 output_base_dir = "data/03_outraster"
 raster_files = {
