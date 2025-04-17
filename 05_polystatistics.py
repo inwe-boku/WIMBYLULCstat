@@ -1,357 +1,195 @@
+#!/usr/bin/env python3
+"""
+Aggregate CLC-based statistics for turbine hull layers across countries and datasets.
+
+This script:
+- Reads processed GeoPackages containing CLC-enriched polygon layers.
+- Loads CLC lookup tables from an Excel file.
+- Computes summary statistics (area, clipped area, percent coverage, area share) per CLC class.
+- Exports both GeoPackage layers and per-country Excel reports.
+
+Usage:
+    python process_clc_stats.py [--countries austria,france]
+"""
+
+import argparse
 import os
+from typing import Dict, List, Optional
 
 import geopandas as gpd
 import pandas as pd
 from tqdm import tqdm
 
-# EPSG definition
-ccrs = "epsg:3035"  # Equal area Europe
+# -----------------------------------------------------------------------------
+# Configuration (override via CLI)
+# -----------------------------------------------------------------------------
+PROJECT_CRS = "EPSG:3035"
+INPUT_DIR = "data/04_clc"
+OUTPUT_DIR = "data/05_stat"
+CLC_LOOKUP = "data/CLC/CLC.xlsx"
+DATASETS = ["new", "all"]
+POLY_LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
+CLC_TYPES = ["clc100", "clc10"]
+RESULT_FIELDS = ["area", "carea", "careap", "ashare"]
 
-clc_datasets = ["clc100", "clc10"]
 
-countries = [
-    "austria",
-    "belgium",
-    "denmark",
-    "estonia",
-    "france",
-    "germany",
-    "greece",
-    "ireland",
-    "italy",
-    "latvia",
-    "lithuania",
-    "luxemburg",
-    "netherlands",
-    "norway",
-    "poland",
-    "portugal",
-    "spain",
-    "sweden",
-    "unitedkingdom",
-]  # Add other countries as needed
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
 
-gpkg_path = "data/04_clc"  # Path to input GeoPackage
-out_path = "data/05_stat"
-poly_layers = ["bufferpolys", "concavehulls", "convexhulls"]
-resultfields = ["area", "carea", "careap", "ashare"]
-clc_file = "data/CLC/CLC.xlsx"
-datasets = ["new", "all"]
+    Returns:
+        argparse.Namespace: Parsed arguments with 'countries'.
+    """
+    parser = argparse.ArgumentParser(description="Compute CLC statistics for turbine hulls per country and dataset.")
+    parser.add_argument(
+        "--countries",
+        type=str,
+        help="Comma-separated list of country folder names to process (overrides auto-detection).",
+    )
+    return parser.parse_args()
+
+
+def get_countries(base_dir: str, override: Optional[List[str]] = None) -> List[str]:
+    """
+    Determine which country folders to process.
+
+    Args:
+        base_dir (str): Path containing country subdirectories.
+        override (List[str] or None): Explicit list provided via CLI.
+
+    Returns:
+        List[str]: Sorted list of country folder names.
+    """
+    if override:
+        return [c.strip() for c in override]
+    try:
+        entries = os.listdir(base_dir)
+    except FileNotFoundError:
+        return []
+    return sorted([d for d in entries if os.path.isdir(os.path.join(base_dir, d))])
+
+
+def load_clc_lookup(path: str) -> Dict[str, pd.DataFrame]:
+    """
+    Load CLC lookup tables from an Excel file.
+
+    Args:
+        path (str): Excel file with sheets for each CLC type.
+
+    Returns:
+        Dict[str, DataFrame]: Mapping of clc_type to lookup DataFrame.
+    """
+    lookup: Dict[str, pd.DataFrame] = {}
+    for clc in CLC_TYPES:
+        try:
+            df = pd.read_excel(path, sheet_name=clc)
+            if "Category" in df.columns and "CatName" in df.columns:
+                df["CatName"] = df.groupby("Category")["CatName"].ffill()
+            lookup[clc] = df
+        except Exception:
+            lookup[clc] = pd.DataFrame()
+    return lookup
+
+
+def compute_stats_for_layer(poly_gdf: gpd.GeoDataFrame, clc_type: str, lookup_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For one polygon layer, compute CLC statistics per class.
+
+    Args:
+        poly_gdf (GeoDataFrame): Polygon layer with CLC count/value columns.
+        clc_type (str): e.g. 'clc100'.
+        lookup_df (DataFrame): Lookup table with 'Value' column.
+
+    Returns:
+        DataFrame: Indexed by 'Value' with columns [area, carea, careap, ashare].
+    """
+    # Identify count and value columns
+    cd_cols = [c for c in poly_gdf.columns if c.startswith(f"{clc_type}_CD_")]
+    val_cols = [c for c in poly_gdf.columns if c.startswith(f"{clc_type}_VAL_")]
+    total_cd = poly_gdf[cd_cols].sum() if cd_cols else pd.Series(dtype=int)
+    total_val = poly_gdf[val_cols].sum() if val_cols else pd.Series(dtype=int)
+    total_val_sum = total_val.sum()
+
+    rows = []
+    for col in sorted(total_val.index):
+        val = int(col.rsplit("_", 1)[-1])
+        area = int(total_val[col])
+        carea = int(total_cd.get(col.replace("VAL", "CD"), 0))
+        careap = round(carea / area * 100, 2) if area > 0 else 0
+        ashare = round(area / total_val_sum * 100, 2) if total_val_sum > 0 else 0
+        rows.append({"Value": val, "area": area, "carea": carea, "careap": careap, "ashare": ashare})
+
+    stats_df = pd.DataFrame(rows).set_index("Value")
+    # Ensure all lookup values are present
+    if "Value" in lookup_df:
+        vals = lookup_df["Value"].dropna().astype(int).unique()
+        stats_df = stats_df.reindex(vals, fill_value=0)
+    return stats_df
+
+
+def process_country(country: str, args: argparse.Namespace, lookup: Dict[str, pd.DataFrame]) -> None:
+    """
+    Process all datasets for a single country: compute and save stats.
+
+    Args:
+        country (str): Country folder name.
+        args (Namespace): Parsed CLI arguments.
+        lookup (dict): CLC lookup tables.
+    """
+    in_dir = os.path.join(INPUT_DIR, country)
+    out_gpkg_dir = os.path.join(OUTPUT_DIR, "gpkg")
+    out_xls_dir = os.path.join(OUTPUT_DIR, "xls")
+    os.makedirs(out_gpkg_dir, exist_ok=True)
+    os.makedirs(out_xls_dir, exist_ok=True)
+
+    for ds in DATASETS:
+        src_path = os.path.join(in_dir, f"{country}_{ds}.gpkg")
+        if not os.path.exists(src_path):
+            continue
+
+        # Read and save turbines layer
+        gdf_turb = gpd.read_file(src_path, layer="turbines")
+        out_gpkg = os.path.join(out_gpkg_dir, f"{country}_{ds}.gpkg")
+        gdf_turb.to_file(out_gpkg, layer="turbines", driver="GPKG")
+
+        # Load polygon layers once
+        polys = {ly: gpd.read_file(src_path, layer=ly) for ly in POLY_LAYERS}
+
+        # Write Excel report
+        xls_path = os.path.join(out_xls_dir, f"{country}_{ds}.xlsx")
+        with pd.ExcelWriter(xls_path) as writer:
+            for clc in CLC_TYPES:
+                lookup_df = lookup.get(clc, pd.DataFrame())
+                if lookup_df.empty:
+                    continue
+                sheet_df = None
+                for ly in POLY_LAYERS:
+                    stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
+                    stats.columns = [f"{ly}_{c}" for c in stats.columns]
+                    sheet_df = stats if sheet_df is None else sheet_df.join(stats)
+                sheet_df.to_excel(writer, sheet_name=clc)
+
+        # Append polygon layers to output GeoPackage
+        for ly in POLY_LAYERS:
+            gdf = polys[ly]
+            gdf.to_file(out_gpkg, layer=ly, driver="GPKG", mode="a")
 
 
 def main():
-    # Set up output folders
-    os.makedirs(out_path, exist_ok=True)
-    os.makedirs(os.path.join(out_path, "xls"), exist_ok=True)
-    os.makedirs(os.path.join(out_path, "gpkg"), exist_ok=True)
+    """
+    Entry point: parse args, detect countries, load lookup, and process.
+    """
+    args = parse_args()
+    override = args.countries.split(",") if args.countries else None
+    countries = get_countries(INPUT_DIR, override)
+    if not countries:
+        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+        return
 
-    bindex = resultfields * len(poly_layers)
-    tindex = [item for item in poly_layers for _ in range(len(resultfields))]
-
-    # Load CLC data from Excel
-    clcdata = {}
-    print("Loading CLC data...")
-    for clcd in clc_datasets:
-        try:
-            clcxls = pd.read_excel(clc_file, sheet_name=clcd)
-            # Ensure 'Category' and 'CatName' exist before applying groupby/ffill
-            if "Category" in clcxls.columns and "CatName" in clcxls.columns:
-                clcxls["CatName"] = clcxls.groupby("Category")["CatName"].transform(lambda x: x.ffill())
-            else:
-                print(f"Warning: 'Category' or 'CatName' not found in sheet {clcd}. Skipping ffill.")
-            clcdata[clcd] = clcxls
-        except Exception as e:
-            print(f"Error loading sheet {clcd} from {clc_file}: {e}")
-            clcdata[clcd] = pd.DataFrame()  # Use an empty DataFrame if error occurs
-
-    # Define multi-index templates based on the loaded CLC data
-    base_cols_100 = (
-        ["Value", "Code", "Name", "Category", "CatName"] if "clc100" in clcdata and not clcdata["clc100"].empty else []
-    )
-    clc100bindex = base_cols_100 + bindex
-    clc100tindex = [""] * len(base_cols_100) + tindex
-
-    base_cols_10 = ["Value", "Name", "Category", "CatName"] if "clc10" in clcdata and not clcdata["clc10"].empty else []
-    clc10bindex = base_cols_10 + bindex
-    clc10tindex = [""] * len(base_cols_10) + tindex
-
-    # Process each country and dataset
-    for country in tqdm(countries, desc="Processing Countries"):
-        for newall in tqdm(datasets, desc=f"Processing '{country}' Datasets", leave=False):
-            file_path = os.path.join(gpkg_path, country, f"{country}_{newall}.gpkg")
-            gpkgfile = os.path.join(out_path, "gpkg", f"{country}_{newall}.gpkg")
-            xlsfile = os.path.join(out_path, "xls", f"{country}_{newall}.xlsx")
-
-            try:
-                # Read and save turbines immediately
-                turbines = gpd.read_file(file_path, layer="turbines")
-                # Save turbines to output gpkg (first layer to be written)
-                turbines.to_file(gpkgfile, layer="turbines", driver="GPKG")
-
-                # --- Step 1: Read all polygon layers once and store in a dictionary ---
-                polys_by_layer = {}
-                for polytype in poly_layers:
-                    print(f"Reading polygon layer: {polytype}")
-                    polys = gpd.read_file(file_path, layer=polytype)
-                    # Do not save here; we will save after processing all calculations.
-                    polys_by_layer[polytype] = polys
-
-                # --- Step 2: Process CLC-specific calculations for Excel output ---
-                with pd.ExcelWriter(xlsfile) as writer:
-                    for clcd in clc_datasets:
-                        if clcd not in clcdata or clcdata[clcd].empty:
-                            print(f"Skipping CLC type {clcd} for {country}/{newall} due to loading errors.")
-                            continue
-
-                        clcres = pd.DataFrame()
-                        multi_index = None
-                        # Set up MultiIndex for Excel output based on CLC type
-                        if clcd == "clc100":
-                            if len(clc100tindex) == len(clc100bindex) and clc100bindex:
-                                tuples = list(zip(clc100tindex, clc100bindex))
-                                multi_index = pd.MultiIndex.from_tuples(tuples, names=["Type", "Column"])
-                            else:
-                                print(f"Warning: Cannot create multi-index for clc100 ({country}/{newall}). Skipping.")
-                                continue
-                        elif clcd == "clc10":
-                            if len(clc10tindex) == len(clc10bindex) and clc10bindex:
-                                tuples = list(zip(clc10tindex, clc10bindex))
-                                multi_index = pd.MultiIndex.from_tuples(tuples, names=["Type", "Column"])
-                            else:
-                                print(f"Warning: Cannot create multi-index for clc10 ({country}/{newall}). Skipping.")
-                                continue
-                        else:
-                            print(f"Warning: Unknown clc type '{clcd}'. Skipping multi-index creation.")
-                            continue
-
-                        # Loop over each polygon layer for the current clc type
-                        for polytype in poly_layers:
-                            print(f"Processing CLC '{clcd}', polygon layer: {polytype}")
-                            try:
-                                # Use a temporary copy of the polygon layer for statistics calculation.
-                                polys_temp = polys_by_layer[polytype].copy(deep=True)
-
-                                # --- Apply CLC-specific modifications on the temporary polygons ---
-                                # Multiply values of all columns starting with f"{clcd}_CD_" or f"{clcd}_VAL_" by 100.
-                                scaling_cols = [
-                                    col
-                                    for col in polys_temp.columns
-                                    if col.startswith(f"{clcd}_CD_") or col.startswith(f"{clcd}_VAL_")
-                                ]
-                                if scaling_cols:
-                                    polys_temp[scaling_cols] = polys_temp[scaling_cols] * 100
-
-                                # Add sum columns (exclude any column ending with _sum already)
-                                cd_cols = [
-                                    col
-                                    for col in polys_temp.columns
-                                    if col.startswith(f"{clcd}_CD_") and not col.endswith("_sum")
-                                ]
-                                val_cols = [
-                                    col
-                                    for col in polys_temp.columns
-                                    if col.startswith(f"{clcd}_VAL_") and not col.endswith("_sum")
-                                ]
-                                if cd_cols:
-                                    polys_temp[f"{clcd}_CD_sum"] = polys_temp[cd_cols].sum(axis=1)
-                                if val_cols:
-                                    polys_temp[f"{clcd}_VAL_sum"] = polys_temp[val_cols].sum(axis=1)
-
-                                # --- Statistical Processing for Excel ---
-                                # Select only the columns that are meant for statistics (exclude the new _sum fields)
-                                cdcols = [
-                                    col
-                                    for col in polys_temp.columns
-                                    if col.startswith(f"{clcd}_CD_") and not col.endswith("_sum")
-                                ]
-                                valcols = [
-                                    col
-                                    for col in polys_temp.columns
-                                    if col.startswith(f"{clcd}_VAL_") and not col.endswith("_sum")
-                                ]
-                                cdval = cdcols + valcols
-
-                                if not cdval:
-                                    print(
-                                        f"Warning: No relevant columns for {clcd} in layer '{polytype}' for {country}/{newall}. Skipping statistics."
-                                    )
-                                    result_df = pd.DataFrame(columns=["Value", "area", "carea", "cperc", "ashare"])
-                                else:
-                                    statistics = pd.DataFrame({"count": polys_temp[cdval].sum().astype(int)})
-                                    if statistics.empty or statistics["count"].isnull().all():
-                                        print(
-                                            f"Warning: Statistics empty or all-NaN for layer '{polytype}' ({country}/{newall})."
-                                        )
-                                        result_df = pd.DataFrame(columns=["Value", "area", "carea", "cperc", "ashare"])
-                                    else:
-                                        try:
-                                            statistics.index = pd.CategoricalIndex(
-                                                statistics.index,
-                                                ordered=True,
-                                                categories=sorted(
-                                                    statistics.index.unique(),
-                                                    key=lambda x: (int("".join(filter(str.isdigit, str(x)))), str(x)),
-                                                ),
-                                            )
-                                            df = statistics.sort_index()
-                                        except ValueError as e:
-                                            print(
-                                                f"Error sorting index for {polytype} ({country}/{newall}): {e}. Using default sort."
-                                            )
-                                            df = statistics.sort_index()
-
-                                        df.index = df.index.astype(str)
-                                        df["type"] = df.index.to_series().str.extract(r"_(CD|VAL)_")[0]
-                                        df["value"] = df.index.to_series().str.extract(r"(\d+)$")[0]
-                                        df = df.dropna(subset=["type", "value"])
-
-                                        if df.empty:
-                                            print(
-                                                f"Warning: Could not extract type/value from index for '{polytype}' ({country}/{newall})."
-                                            )
-                                            result_df = pd.DataFrame(
-                                                columns=["Value", "area", "carea", "cperc", "ashare"]
-                                            )
-                                        else:
-                                            df["value"] = df["value"].astype(int)
-                                            total_val_count = df.loc[df["type"] == "VAL", "count"].sum()
-
-                                            agg_funcs = {
-                                                "VAL": pd.NamedAgg(
-                                                    column="count",
-                                                    aggfunc=lambda x: x[df.loc[x.index, "type"] == "VAL"].sum(),
-                                                ),
-                                                "CD": pd.NamedAgg(
-                                                    column="count",
-                                                    aggfunc=lambda x: x[df.loc[x.index, "type"] == "CD"].sum(),
-                                                ),
-                                            }
-                                            result_df = df.groupby("value").agg(**agg_funcs).reset_index()
-                                            result_df["CDp"] = (
-                                                result_df["CD"] / result_df["VAL"].replace(0, pd.NA) * 100
-                                            ).round(2)
-                                            result_df["VALtotp"] = (
-                                                result_df["VAL"] / total_val_count if total_val_count else 0
-                                            ).round(2)
-                                            result_df = result_df.rename(
-                                                columns={
-                                                    "value": "Value",
-                                                    "VAL": "area",
-                                                    "CD": "carea",
-                                                    "CDp": "cperc",
-                                                    "VALtotp": "ashare",
-                                                }
-                                            )
-                                            result_df = result_df[["Value", "area", "carea", "cperc", "ashare"]]
-
-                                # Merge computed statistics into the base CLC data
-                                polyres_base = clcdata[clcd].copy()
-                                if "Value" in polyres_base.columns:
-                                    try:
-                                        polyres_base["Value"] = pd.to_numeric(polyres_base["Value"], errors="coerce")
-                                        polyres_base = polyres_base.dropna(subset=["Value"])
-                                        polyres_base["Value"] = polyres_base["Value"].astype(int)
-                                        polyres_merged = pd.merge(
-                                            polyres_base, result_df, on="Value", how="left"
-                                        ).fillna(0)
-                                        polyres_merged[["area", "carea"]] = polyres_merged[["area", "carea"]].astype(
-                                            int
-                                        )
-                                    except Exception as merge_err:
-                                        print(f"Error merging results for {polytype} ({country}/{newall}): {merge_err}")
-                                        polyres_merged = polyres_base.copy()
-                                        for col in ["area", "carea", "cperc", "ashare"]:
-                                            polyres_merged[col] = 0
-                                else:
-                                    print(f"Warning: 'Value' column missing in base CLC data for {clcd}.")
-                                    polyres_merged = polyres_base.copy()
-                                    for col in ["area", "carea", "cperc", "ashare"]:
-                                        polyres_merged[col] = 0
-
-                                # Accumulate results (concatenating horizontally)
-                                if clcres.empty:
-                                    clcres = polyres_merged
-                                else:
-                                    cols_to_concat = ["area", "carea", "cperc", "ashare"]
-                                    if all(col in polyres_merged.columns for col in cols_to_concat):
-                                        clcres = pd.concat([clcres, polyres_merged[cols_to_concat]], axis=1)
-                                    else:
-                                        print(
-                                            f"Warning: Some result columns missing for {polytype}. Skipping concatenation."
-                                        )
-                                        missing_cols_df = pd.DataFrame(0, index=clcres.index, columns=cols_to_concat)
-                                        clcres = pd.concat([clcres, missing_cols_df], axis=1)
-
-                            except Exception as poly_err:
-                                print(
-                                    f"Error processing polygon layer '{polytype}' for {clcd} in {country}/{newall}: {poly_err}"
-                                )
-                                if not clcres.empty:
-                                    empty_res_df = pd.DataFrame(
-                                        0, index=clcres.index, columns=["area", "carea", "cperc", "ashare"]
-                                    )
-                                    clcres = pd.concat([clcres, empty_res_df], axis=1)
-
-                        # Write the accumulated results for the current CLC type to the Excel file.
-                        if not clcres.empty and multi_index is not None:
-                            if len(clcres.columns) == len(multi_index):
-                                clcres.columns = multi_index
-                                clcres.to_excel(writer, sheet_name=clcd)
-                            else:
-                                print(
-                                    f"Error: Column count mismatch for {clcd} in {country}/{newall}. Skipping sheet write."
-                                )
-                        elif clcres.empty:
-                            print(f"Info: No results for CLC type {clcd} in {country}/{newall}.")
-                        elif multi_index is None:
-                            print(f"Info: MultiIndex not created for {clcd} in {country}/{newall}.")
-                # --- End of Excel processing ---
-
-                # --- Step 3: Save the modified polygon layers after all calculations ---
-                # Here we update each polygon layer in place for all clc types
-                # and then write each layer only once to the gpkg file.
-                # Remove any existing poly layers in the output GeoPackage if needed.
-                if os.path.exists(gpkgfile):
-                    os.remove(gpkgfile)
-                    # Save turbines again to ensure it is in the output file.
-                    turbines.to_file(gpkgfile, layer="turbines", driver="GPKG")
-
-                for i, polytype in enumerate(poly_layers):
-                    # Start from the original polygon layer
-                    final_polys = polys_by_layer[polytype].copy(deep=True)
-                    for clcd in clc_datasets:
-                        # Multiply CLC-specific columns (if they exist) by 100.
-                        scaling_cols = [
-                            col
-                            for col in final_polys.columns
-                            if col.startswith(f"{clcd}_CD_") or col.startswith(f"{clcd}_VAL_")
-                        ]
-                        if scaling_cols:
-                            final_polys[scaling_cols] = final_polys[scaling_cols] * 100
-                        # Add new sum columns.
-                        cd_cols = [
-                            col
-                            for col in final_polys.columns
-                            if col.startswith(f"{clcd}_CD_") and not col.endswith("_sum")
-                        ]
-                        val_cols = [
-                            col
-                            for col in final_polys.columns
-                            if col.startswith(f"{clcd}_VAL_") and not col.endswith("_sum")
-                        ]
-                        if cd_cols:
-                            final_polys[f"{clcd}_CD_sum"] = final_polys[cd_cols].sum(axis=1)
-                        if val_cols:
-                            final_polys[f"{clcd}_VAL_sum"] = final_polys[val_cols].sum(axis=1)
-                    # Write the finalized polygon layer to the GeoPackage.
-                    mode = "w" if i == 0 else "a"
-                    final_polys.to_file(gpkgfile, layer=polytype, driver="GPKG", mode=mode)
-
-            except Exception as file_err:
-                print(f"FATAL ERROR processing base files for {country}/{newall}: {file_err}")
+    lookup = load_clc_lookup(CLC_LOOKUP)
+    for country in tqdm(countries, desc="Countries"):
+        process_country(country, args, lookup)
 
 
 if __name__ == "__main__":
-    print("Starting processing...")
     main()
-    print("Processing finished.")

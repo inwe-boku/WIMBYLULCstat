@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""Process turbine point data to create buffer, convex and concave hulls per cluster.
+
+This script:
+- Reads GeoPackage point datasets per country/dataset.
+- Performs DBSCAN clustering to group turbines.
+- Calculates buffer sizes per cluster.
+- Generates buffer polygons, convex hulls, and concave hulls.
+- Writes each layer to output GeoPackages.
+
+Configurable via command-line arguments:
+    --countries: comma-separated list of country folder names to process.
+"""
+
+import argparse
 import os
 
 import geopandas as gpd
@@ -6,372 +21,225 @@ from scipy.spatial import distance
 from shapely.geometry import Point
 from shapely.ops import split
 from sklearn.cluster import DBSCAN
-from tqdm import tqdm  # For progress bars
+from tqdm import tqdm
 
-# Constants
+# -----------------------------------------------------------------------------
+# Configuration Variables (override via CLI)
+# -----------------------------------------------------------------------------
+INPUT_DIR = "data/01_outregions"
+OUTPUT_DIR = "data/02_outhulls"
+DATASETS = ["new", "all", "old"]
 CRS = "epsg:3035"
-EPSILON = 1500  # DBSCAN distance threshold
-MIN_SAMPLES = 2  # Minimum samples for DBSCAN clustering
-BUFFERPERC = 0.5  # Buffer percentage
+EPSILON = 1500  # DBSCAN eps distance threshold in CRS units
+MIN_SAMPLES = 2  # Minimum samples to form a cluster
+BUFFERPERC = 0.5  # Percentage of nearest neighbor distance for buffer
 BUFFERSCALE1 = 2 / 3
 BUFFERSCALE2 = 1 / 2
-SAMPLE_POINTS = 99
-CONCAVE_RATIO = 0.25
+SAMPLE_POINTS = 99  # Number of points to sample on buffer boundary
+CONCAVE_RATIO = 0.25  # Concave hull ratio parameter
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Create hull layers around clustered turbine points.")
+    parser.add_argument(
+        "--countries",
+        type=str,
+        help="Comma-separated list of country folder names to process (overrides auto-detection).",
+    )
+    return parser.parse_args()
+
+
+def get_countries(input_dir, override_list=None):
+    """Determine list of countries by scanning input_dir or using override."""
+    if override_list:
+        return [c.strip() for c in override_list]
+    try:
+        entries = os.listdir(input_dir)
+    except FileNotFoundError:
+        return []
+    countries = [d for d in entries if os.path.isdir(os.path.join(input_dir, d))]
+    return sorted(countries)
 
 
 def clustercalculation(turbines):
-    coords = turbines.geometry.apply(lambda geom: (geom.x, geom.y)).tolist()
-    dbscan = DBSCAN(eps=EPSILON, min_samples=MIN_SAMPLES)
-    clusters = dbscan.fit_predict(coords)
-    turbines["cluster"] = clusters
-
-    # Calculate buffer sizes
+    """Assign DBSCAN clusters and calculate buffer per cluster."""
+    coords = [(geom.x, geom.y) for geom in turbines.geometry]
+    labels = DBSCAN(eps=EPSILON, min_samples=MIN_SAMPLES).fit_predict(coords)
+    turbines["cluster"] = labels
     cluster_distances = {}
-    for clusternum in np.unique(clusters):
-        if clusternum == -1:
-            continue  # Skip noise points
-        cpoints = turbines[turbines["cluster"] == clusternum]["geometry"]
-        ccoords = np.array([(point.x, point.y) for point in cpoints])
-        distance_matrix = distance.cdist(ccoords, ccoords)
-        distance_matrix[distance_matrix < 9] = np.inf
-        min_distances = np.min(distance_matrix, axis=1)
-
-        # Calculate buffer size if there are valid distances
-        valid_distances = min_distances[np.isfinite(min_distances)]
-        if len(valid_distances) > 0:
-            buffer = int(round(np.mean(valid_distances * BUFFERPERC), 0))
-        else:
-            buffer = np.nan  # Assign NaN if no valid distances exist
-        cluster_distances[clusternum] = buffer
-
-    # Assign buffers to points
-    turbines["buffer"] = turbines["cluster"].map(cluster_distances)
-
-    # Calculate average buffer size (ignoring NaN) for current dataset
-    valid_buffers = turbines["buffer"].dropna()
-    if not valid_buffers.empty:
-        buffer_default = int(round(valid_buffers.mean(), 0))
-    else:
-        buffer_default = 0  # Fallback if no valid buffers exist at all (edge case)
-
-    # Replace NaN buffers with the average and reassign to the column
-    turbines["buffer"] = turbines["buffer"].fillna(buffer_default)
+    for cid in np.unique(labels):
+        if cid == -1:
+            continue
+        pts = turbines[turbines.cluster == cid].geometry
+        ccoords = np.array([(pt.x, pt.y) for pt in pts])
+        dmat = distance.cdist(ccoords, ccoords)
+        dmat[dmat < 9] = np.inf
+        mins = np.min(dmat, axis=1)
+        valids = mins[np.isfinite(mins)]
+        buf = int(round(valids.mean() * BUFFERPERC, 0)) if len(valids) > 0 else np.nan
+        cluster_distances[cid] = buf
+    turbines["buffer"] = turbines.cluster.map(cluster_distances)
+    default = int(round(turbines.buffer.dropna().mean(), 0)) if not turbines.buffer.dropna().empty else 0
+    turbines["buffer"] = turbines.buffer.fillna(default)
     return turbines
 
 
-def create_hulls(points, hull_type="convex"):
-    if hull_type == "buffer":
-        hull_gdf = create_buffer_polygons(points)
-    elif hull_type == "convex":
-        hull_gdf = create_convex_hulls(points)
-    elif hull_type == "concave":
-        hull_gdf = create_concave_hulls2(points)
-    else:
-        raise ValueError("Invalid hull_type. Choose from 'buffer', 'convex', or 'concave'.")
-    hull_gdf.reset_index(inplace=True)
-    hull_gdf["hull_id"] = hull_gdf.index + 1  # Start IDs from 1
-    return hull_gdf
-
-
-# Supporting Functions
 def create_buffer_polygons(points):
-    # Use vectorized buffer operation to create buffer polygons
-    bufferpolys = points.copy(deep=False)
-    bufferpolys.drop(columns=["geometry"], inplace=True)
-    bufferpolys["geometry"] = points.buffer(points["buffer"].values * (BUFFERSCALE1 + BUFFERSCALE2))
-    return bufferpolys
+    """Generate buffer polygons around points using combined buffer scales."""
+    df = points.copy()
+    df["geometry"] = points.buffer(points.buffer.values * (BUFFERSCALE1 + BUFFERSCALE2))
+    return df
 
 
 def create_convex_hulls(points):
+    """Generate convex hulls per cluster and buffer them."""
     grouped = points.dissolve(by="cluster")
-    buffer_polygons = grouped.convex_hull
-    buffer_polygons = buffer_polygons.buffer(grouped["buffer"].values * (BUFFERSCALE1 + BUFFERSCALE2))
-    bufferpolys = grouped.copy(deep=False)
-    bufferpolys.drop(columns=["geometry"], inplace=True)
-    bufferpolys["geometry"] = buffer_polygons
-    return bufferpolys
+    hulls = grouped.convex_hull.buffer(grouped.buffer.values * (BUFFERSCALE1 + BUFFERSCALE2))
+    df = grouped.copy()
+    df["geometry"] = hulls
+    return df
+
+
+def sample_buffer_boundaries(points, scale, n_points):
+    """Sample n_points along the buffer boundary of each point."""
+    records = []
+    for _, row in points.iterrows():
+        buf_geom = row.geometry.buffer(row.buffer * scale)
+        boundary = buf_geom.boundary
+        coords = list(boundary.coords)
+        step = max(1, len(coords) // n_points)
+        for pt in coords[::step]:
+            rec = row.to_dict()
+            rec["geometry"] = Point(pt)
+            records.append(rec)
+    return gpd.GeoDataFrame(records, crs=points.crs)
 
 
 def create_concave_hulls(points):
-    grouped = points.dissolve(by="cluster")
-    # Assuming the concave hull method is defined elsewhere in the workflow.
-    buffer_polygons = grouped.concave_hull()
-    buffer_polygons = buffer_polygons.buffer(grouped["buffer"].values * (BUFFERSCALE1 + BUFFERSCALE2))
-    bufferpolys = grouped.copy(deep=False)
-    bufferpolys.drop(columns=["geometry"], inplace=True)
-    bufferpolys["geometry"] = buffer_polygons
-    return bufferpolys
+    """Generate concave hulls via boundary sampling and concave_hull op."""
+    bp = sample_buffer_boundaries(points, BUFFERSCALE1, SAMPLE_POINTS)
+    grouped = bp.dissolve(by="cluster")
+    hulls = grouped.concave_hull(ratio=CONCAVE_RATIO).buffer(grouped.buffer.values * BUFFERSCALE2)
+    df = grouped.copy()
+    df["geometry"] = hulls
+    return df
 
 
-def sample_buffer_boundaries(points, buffer_scale=2 / 3, n_points=99):
-    sampled_records = []
-
-    for idx, row in points.iterrows():
-        buffer_geom = row.geometry.buffer(row["buffer"] * buffer_scale)
-        boundary = buffer_geom.boundary
-
-        # Get coordinates from boundary and sample evenly spaced points
-        coords = list(boundary.coords)
-        step = max(1, len(coords) // n_points)
-        sampled_coords = coords[::step]
-
-        for pt in sampled_coords:
-            sampled_record = row.to_dict()
-            sampled_record["geometry"] = Point(pt)
-            sampled_records.append(sampled_record)
-
-    # Create GeoDataFrame from sampled points with all original attributes
-    bufferpoints = gpd.GeoDataFrame(sampled_records, crs=points.crs)
-    return bufferpoints
-
-
-def create_concave_hulls2(
-    points,
-    buffer_scale1=BUFFERSCALE1,
-    buffer_scale2=BUFFERSCALE2,
-    n_points=SAMPLE_POINTS,
-    concave_ratio=CONCAVE_RATIO,
-):
-    bufferpoints = sample_buffer_boundaries(points, buffer_scale=buffer_scale1, n_points=n_points)
-    grouped = bufferpoints.dissolve(by="cluster")
-    buffer_polygons = grouped.concave_hull(ratio=concave_ratio)
-    buffer_polygons = buffer_polygons.buffer(grouped["buffer"].values * buffer_scale2)
-    bufferpolys = grouped.copy(deep=False)
-    bufferpolys.drop(columns=["geometry"], inplace=True)
-    bufferpolys["geometry"] = buffer_polygons
-    return bufferpolys
+def create_hulls(points, hull_type="convex"):
+    """Wrapper to generate buffer, convex, or concave hulls."""
+    if hull_type == "buffer":
+        hulls = create_buffer_polygons(points)
+    elif hull_type == "convex":
+        hulls = create_convex_hulls(points)
+    elif hull_type == "concave":
+        hulls = create_concave_hulls(points)
+    else:
+        raise ValueError("Choose 'buffer', 'convex', or 'concave'")
+    hulls.reset_index(inplace=True)
+    hulls["hull_id"] = hulls.index + 1
+    return hulls
 
 
 def split_hulls(hulls, split_polygons):
-    """
-    Splits hulls using boundaries of polygons and retains attributes from the original dataset,
-    ensuring no overlapping or duplicate polygons are retained.
-
-    Parameters:
-        hulls (GeoDataFrame): The GeoDataFrame containing polygons to be split.
-        split_polygons (GeoDataFrame): The GeoDataFrame containing polygons whose boundaries will be used for splitting.
-
-    Returns:
-        GeoDataFrame: Split polygons with attributes retained from the original dataset.
-    """
-    split_lines = split_polygons.boundary  # Extract boundaries (LineString/MultiLineString)
-    split_results = []
-
-    for idx, hull in hulls.iterrows():
-        # Start with the initial geometry
-        geometries_to_split = [hull.geometry]
-        final_geometries = []
-
+    """Split hulls by polygon boundaries and remove duplicates."""
+    split_lines = split_polygons.boundary
+    results = []
+    for _, hull in hulls.iterrows():
+        geoms = [hull.geometry]
         for line in split_lines:
-            next_geometries = []
-            for geometry in geometries_to_split:
-                if geometry.intersects(line):
-                    # Split the geometry by the line
-                    split_geom = split(geometry, line)
-                    next_geometries.extend(geom for geom in split_geom.geoms if geom.is_valid and not geom.is_empty)
+            next_geoms = []
+            for g in geoms:
+                if g.intersects(line):
+                    parts = split(g, line)
+                    next_geoms.extend([p for p in parts.geoms if p.is_valid and not p.is_empty])
                 else:
-                    next_geometries.append(geometry)
-            geometries_to_split = next_geometries  # Update geometries to process in the next iteration
-
-        # Add final geometries with attributes
-        for geom in geometries_to_split:
-            final_geometries.append({**hull.to_dict(), "geometry": geom})
-
-        # Avoid duplicates in geometries for this hull
-        unique_geometries = gpd.GeoDataFrame(final_geometries, crs=hulls.crs).drop_duplicates(subset="geometry")
-
-        split_results.extend(unique_geometries.to_dict("records"))
-
-    # Final GeoDataFrame with unique geometries and attributes
-    split_gdf = gpd.GeoDataFrame(split_results, crs=hulls.crs)
-
-    # Ensure no duplicates in the final GeoDataFrame
-    split_gdf = split_gdf.drop_duplicates(subset=split_gdf.columns.to_list())
-
-    return split_gdf
+                    next_geoms.append(g)
+            geoms = next_geoms
+        for g in geoms:
+            rec = hull.to_dict()
+            rec["geometry"] = g
+            results.append(rec)
+    return gpd.GeoDataFrame(results, crs=hulls.crs).drop_duplicates(subset="geometry")
 
 
-def assign_tile_best(turbines, split_polygons):
-    """
-    Assigns the most common 'tile_best' value from turbine points to split polygons.
-
-    Parameters:
-        turbines (GeoDataFrame): Turbine points dataset.
-        split_polygons (GeoDataFrame): Split polygons dataset.
-
-    Returns:
-        GeoDataFrame: Split polygons with 'tile_best' assigned.
-    """
+def assign_tile_best(turbines, polygons):
+    """Assign most common turbine.tile_best to each polygon."""
     if "tile_best" not in turbines.columns:
-        # print("[INFO] 'tile_best' field not found in turbine points. Skipping assignment.")
-        split_polygons["tile_best"] = None
-        return split_polygons
-
-    # Ensure both datasets have the same CRS for spatial operations
-    turbines = turbines.to_crs(split_polygons.crs)
-
-    # Add a new column to store 'tile_best' for each polygon
-    split_polygons["tile_best"] = None
-
-    for idx, polygon in split_polygons.iterrows():
-        # Select turbine points within the polygon
-        turbines_within = turbines[turbines.geometry.within(polygon.geometry)]
-
-        if not turbines_within.empty and "tile_best" in turbines_within.columns:
-            # Get the most common 'tile_best' value
-            most_common_tile = turbines_within["tile_best"].mode()
-            if not most_common_tile.empty:
-                split_polygons.at[idx, "tile_best"] = most_common_tile[0]
-
-    return split_polygons
+        polygons["tile_best"] = None
+        return polygons
+    turbines = turbines.to_crs(polygons.crs)
+    polygons["tile_best"] = None
+    for idx, poly in polygons.iterrows():
+        pts = turbines[turbines.geometry.within(poly.geometry)]
+        if not pts.empty:
+            mode = pts["tile_best"].mode()
+            if not mode.empty:
+                polygons.at[idx, "tile_best"] = mode[0]
+    return polygons
 
 
 def merge_slivers(hulls, slivers):
-    """
-    Calculates the original polygon area, split polygon area, and the percentage of the original area for each split polygon.
-    For polygons with less than 1% area_percentage, merges them with the first found adjacent polygon
-    and removes both individual polygons, keeping only the merged result.
-
-    Parameters:
-        hulls (GeoDataFrame): The GeoDataFrame containing the original polygons before the split.
-        slivers (GeoDataFrame): The GeoDataFrame containing the split polygons.
-
-    Returns:
-        GeoDataFrame: The updated GeoDataFrame with merged slivers removed and fields added.
-    """
-    # Ensure there is a unique identifier to match split polygons with their originals
+    """Merge sliver polygons (<1% area) with adjacent ones."""
     if "hull_id" not in hulls.columns or "hull_id" not in slivers.columns:
-        raise ValueError("Both 'hulls' and 'slivers' GeoDataFrames must contain a 'hull_id' column.")
-
-    # Add a field for the original polygon area in the hulls GeoDataFrame
+        raise ValueError("Missing 'hull_id'")
     hulls["original_area"] = hulls.geometry.area
-
-    # Add fields for split polygon area and percentage of the original area
-    slivers = slivers.copy()  # Work on a copy to avoid modifying the original GeoDataFrame
-    slivers["split_area"] = slivers.geometry.area
-    slivers = slivers.merge(hulls[["hull_id", "original_area"]], on="hull_id", how="left")
-    slivers["area_percentage"] = (slivers["split_area"] / slivers["original_area"]) * 100
-
-    # List to hold the updated polygons
-    updated_polygons = []
-    processed_indices = set()  # Track processed polygons to avoid double-merging
-
-    for idx, sliver in slivers.iterrows():
-        if idx in processed_indices:
-            continue  # Skip already processed polygons
-
-        if sliver["area_percentage"] < 1:  # Check for sliver condition
-            # Find adjacent polygons
-            adjacent_polygons = slivers[
-                slivers.geometry.touches(sliver.geometry) & ~slivers.index.isin(processed_indices)
-            ]
-
-            if not adjacent_polygons.empty:
-                # Merge with the first adjacent polygon
-                first_adjacent = adjacent_polygons.iloc[0]
-                merged_poly = sliver.geometry.union(first_adjacent.geometry)
-
-                # Add the merged polygon with attributes from the sliver polygon
-                merged_attributes = sliver.to_dict()
-                merged_attributes["geometry"] = merged_poly
-                updated_polygons.append(merged_attributes)
-
-                # Mark both polygons as processed
-                processed_indices.add(idx)
-                processed_indices.add(first_adjacent.name)
+    sl = slivers.copy()
+    sl["split_area"] = sl.geometry.area
+    sl = sl.merge(hulls[["hull_id", "original_area"]], on="hull_id", how="left")
+    sl["area_percentage"] = sl.split_area / sl.original_area * 100
+    updated = []
+    processed = set()
+    for idx, s in sl.iterrows():
+        if idx in processed:
+            continue
+        if s.area_percentage < 1:
+            adj = sl[sl.geometry.touches(s.geometry) & ~sl.index.isin(processed)]
+            if not adj.empty:
+                first = adj.iloc[0]
+                merged_geom = s.geometry.union(first.geometry)
+                rec = s.to_dict()
+                rec["geometry"] = merged_geom
+                updated.append(rec)
+                processed.update({idx, first.name})
             else:
-                # If no adjacent polygon is found, keep the sliver as is
-                updated_polygons.append(sliver.to_dict())
+                updated.append(s.to_dict())
+                processed.add(idx)
         else:
-            # If not a sliver, keep the polygon as is
-            updated_polygons.append(sliver.to_dict())
-            processed_indices.add(idx)
-
-    # Create a GeoDataFrame from the updated polygons
-    updated_gdf = gpd.GeoDataFrame(updated_polygons, crs=slivers.crs)
-
-    # Ensure no duplicates in the final GeoDataFrame
-    updated_gdf = updated_gdf.drop_duplicates(subset="geometry")
-
-    updated_gdf["split_area"] = updated_gdf.geometry.area
-    updated_gdf["area_percentage"] = (updated_gdf["split_area"] / updated_gdf["original_area"]) * 100
-
-    return updated_gdf
+            updated.append(s.to_dict())
+            processed.add(idx)
+    df = gpd.GeoDataFrame(updated, crs=sl.crs).drop_duplicates(subset="geometry")
+    df["split_area"] = df.geometry.area
+    df["area_percentage"] = df.split_area / df.original_area * 100
+    return df
 
 
 def main():
-    # Define input/output directories
-    # split_dir = "data/TURBINES/"
-    input_dir = "data/01_outregions/"
-    output_dir = "data/02_outhulls/"
-
-    # Define inputs
-    countries = [
-        "austria",
-        "belgium",
-        "denmark",
-        "estonia",
-        "france",
-        "germany",
-        "greece",
-        "ireland",
-        "italy",
-        "latvia",
-        "lithuania",
-        "luxemburg",
-        "netherlands",
-        "norway",
-        "poland",
-        "portugal",
-        "spain",
-        "sweden",
-        "unitedkingdom",
-    ]  # Add other countries as needed
-
-    datasets = ["new", "all", "old"]
-
-    for country in tqdm(countries, desc="Processing Countries"):
-        country_output_dir = os.path.join(output_dir, country)
-        os.makedirs(country_output_dir, exist_ok=True)
-
-        # Split Convex and Concave Hulls
-        # split_lines = gpd.read_file(
-        #    os.path.join(split_dir, country, f"{country}_raster_tiles_poly.shp")
-        # ).to_crs(CRS)
-        # split_lines = split_lines.explode()  # Ensure multiline geometries are split
-
-        for dataset in tqdm(datasets, desc=f"Processing Datasets ({country})", leave=False):
-            # ------------------------------------------------------------------
-            # 1.  Build full path and make sure the file exists
-            # ------------------------------------------------------------------
-            input_file = os.path.join(input_dir, country, f"{country}_{dataset}.gpkg")
-            if not os.path.exists(input_file):
-                print(f"[WARNING] File not found: {input_file}")
+    """Entry point: parse args, detect countries, process each hull type."""
+    args = parse_args()
+    override = args.countries.split(",") if args.countries else None
+    countries = get_countries(INPUT_DIR, override)
+    if not countries:
+        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for country in tqdm(countries, desc="Countries"):
+        country_out = os.path.join(OUTPUT_DIR, country)
+        os.makedirs(country_out, exist_ok=True)
+        for ds in DATASETS:
+            fp = os.path.join(INPUT_DIR, country, f"{country}_{ds}.gpkg")
+            if not os.path.exists(fp):
                 continue
-
-            # ------------------------------------------------------------------
-            # 2.  Read & **skip** empty layers
-            # ------------------------------------------------------------------
-            turbines = gpd.read_file(input_file)  # read whatever layer is first
-            if turbines.empty:  # 👈  new guard‑clause
-                print(f"[INFO] {input_file} contains 0 features – skipping.")
+            gdf = gpd.read_file(fp)
+            if gdf.empty:
                 continue
-
-            turbines = turbines.to_crs(CRS).drop_duplicates(subset="geometry")
-            # ------------------------------------------------------------------
-            # 3.  …everything below is unchanged …
-            # ------------------------------------------------------------------
-            turbines = clustercalculation(turbines)
-            turbines.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="turbines")
-
-            bufferpolys = create_hulls(turbines, "buffer")
-            bufferpolys.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="bufferpolys")
-
-            convex_hulls = create_hulls(turbines[turbines["cluster"] != -1], "convex")
-            concave_hulls = create_hulls(turbines[turbines["cluster"] != -1], "concave")
-
-            concave_hulls.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="concavehulls")
-            convex_hulls.to_file(os.path.join(country_output_dir, f"{country}_{dataset}.gpkg"), layer="convexhulls")
+            gdf = gdf.to_crs(CRS).drop_duplicates(subset="geometry")
+            gdf = clustercalculation(gdf)
+            gdf.to_file(os.path.join(country_out, f"{country}_{ds}.gpkg"), layer="turbines")
+            for htype, layer in [("buffer", "bufferpolys"), ("convex", "convexhulls"), ("concave", "concavehulls")]:
+                hulls = create_hulls(gdf, htype)
+                hulls.to_file(os.path.join(country_out, f"{country}_{ds}.gpkg"), layer=layer)
 
 
-main()
+if __name__ == "__main__":
+    main()
