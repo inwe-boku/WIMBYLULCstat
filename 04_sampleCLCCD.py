@@ -1,520 +1,342 @@
+#!/usr/bin/env python3
+"""
+Script for processing Corine Land Cover (CLC) data for specified countries,
+with progress indicators for tile‐masking and per‐layer hull processing.
+
+Usage:
+    python process_clc.py --countries austria,france
+"""
+
 import argparse
 import os
 import re
 
 import geopandas as gpd
 import numpy as np
-
-# from shapely.wkt import loads
 import pandas as pd
 import rasterio
-
-# from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
 from shapely.geometry import Point, box
+from tqdm import tqdm
 
-debug = True
-project_crs = "EPSG:3035"
-clc_files = {
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+DEBUG = True
+PROJECT_CRS = "EPSG:3035"
+CLC_FILES = {
     "clc100": {"file": "U2018_CLC2018_V2020_20u1.tif"},
     "clc10": {"file": "CLMS_CLCplus_RASTER_2018_010m_eu_03035_V1_1.tif"},
 }
+DATASETS = ["new", "old", "all"]
+SAMPLE_LAYER = "convexhulls"
+LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
 
-# countries = ["france"] #["austria", "france"]
-datasets = ["old"]
 
-
-# Function to read raster files and extract their bounds
 def read_raster_bounds(cdtile_path):
+    """
+    Read binary raster tile files from a directory and extract their bounds,
+    CRS, and a 'channel' identifier from the filename.
+
+    Returns a DataFrame with columns:
+      - tile_name: e.g. '29UNA'
+      - channel:   e.g. 'ch3lt0'
+      - bounds:    shapely Polygon
+      - crs:       CRS string
+    """
     tile_data = []
-    tile_crs = None
-
-    for raster_file in sorted(os.listdir(cdtile_path)):
-        if raster_file.endswith("_binary.tif"):
-            raster_path = os.path.join(cdtile_path, raster_file)
-            with rasterio.open(raster_path) as src:
+    for fn in sorted(os.listdir(cdtile_path)):
+        if fn.endswith("_binary.tif"):
+            path = os.path.join(cdtile_path, fn)
+            with rasterio.open(path) as src:
                 bounds = box(*src.bounds)
-                tile_name = re.match(r"^([0-9A-Z]+)", raster_file).group(1)
+                tile_id = re.match(r"^([0-9A-Z]+)", fn).group(1)
+                pattern = re.compile(r"^[0-9A-Z]+_([A-Za-z0-9_]+)_binary\.tif$")
+                channel = pattern.match(fn).group(1)
                 tile_crs = src.crs.to_string()
-                tile_data.append({"tile_name": tile_name, "bounds": bounds, "crs": tile_crs})
-
-    tile_df = pd.DataFrame(tile_data)
-    return tile_df
+                tile_data.append({"tile_name": tile_id, "channel": channel, "bounds": bounds, "crs": tile_crs})
+    return pd.DataFrame(tile_data)
 
 
-def process_hulls_and_tiles(hulls: gpd.GeoDataFrame, tile_df: pd.DataFrame):
+def process_hulls_and_tiles(hulls: gpd.GeoDataFrame, tile_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """
-    Process and clip hulls to tiles, matching and calculating areas.
-
-    Parameters:
-        hulls (gpd.GeoDataFrame): GeoDataFrame with polygons and 'tile_best' column.
-        tile_df (pd.DataFrame): DataFrame with columns 'tile_name', 'bounds' (shapely Polygons), and 'crs'.
-
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame of processed hulls with added columns.
+    Clip hull polygons to each tile, compute clipped areas, subtract the best clips,
+    then clip the remainder. Returns all clipped parts in PROJECT_CRS.
     """
-    # Add area and hull_id to the hulls GeoDataFrame
     hulls = hulls.copy()
     hulls["area"] = hulls.geometry.area.astype(int)
     hulls["hull_id"] = hulls.index
+    best_clips = []
 
-    hulls_best = []
-
+    # First pass: gather the 'best' portions
     for _, tile in tile_df.iterrows():
-        tile_name = tile["tile_name"]
-        tile_bounds = tile["bounds"]
-        tile_crs = tile["crs"]
+        name, bounds, crs = tile["tile_name"], tile["bounds"], tile["crs"]
+        in_crs = hulls.to_crs(crs)
+        poly = gpd.GeoDataFrame({"geometry": [bounds]}, crs=crs)
+        clipped = gpd.overlay(in_crs, poly, how="intersection")
+        keep = []
+        for _, part in clipped.iterrows():
+            orig = hulls.loc[part["hull_id"]]
+            if orig["tile_best"] == name:
+                a = part.geometry.area
+                pct = (a / orig["area"] * 100) if orig["area"] > 0 else 0
+                part["areac"] = int(a)
+                part["areap"] = round(pct, 2)
+                part["tile_sample"] = name
+                keep.append(part)
+        if keep:
+            df = pd.DataFrame(keep)
+            gdf = gpd.GeoDataFrame(df, geometry="geometry", crs=crs)
+            best_clips.append(gdf.to_crs(PROJECT_CRS))
 
-        # Ensure hulls are in the tile CRS
-        hulls_in_tile_crs = hulls.to_crs(tile_crs)
-
-        # Clip hulls to the tile bounds
-        tile_polygon = gpd.GeoDataFrame({"geometry": [tile_bounds]}, crs=tile_crs)
-        clipped_hulls = gpd.overlay(hulls_in_tile_crs, tile_polygon, how="intersection")
-
-        hulls_tile = []
-
-        # Loop through the clipped hulls
-        for idx, clipped_hull in clipped_hulls.iterrows():
-            original_hull = hulls.loc[clipped_hull["hull_id"]]
-
-            if original_hull["tile_best"] == tile_name:
-                # Calculate area of the clipped feature
-                areac = clipped_hull.geometry.area
-                areap = areac / original_hull["area"] if original_hull["area"] > 0 else 0
-
-                # Add the processed hull to the list
-                clipped_hull["areac"] = int(areac)
-                clipped_hull["areap"] = round(areap * 100, 2)
-                clipped_hull["tile_sample"] = tile_name
-                hulls_tile.append(clipped_hull)
-
-        # Combine all processed hulls into a new GeoDataFrame
-        hulls_tile = pd.DataFrame(hulls_tile)
-        if hulls_tile.empty:
-            continue
-        hulls_tile_gdf = gpd.GeoDataFrame(hulls_tile, geometry="geometry", crs=tile_crs)
-        hulls_tile_gdf = hulls_tile_gdf.to_crs(project_crs)
-        hulls_best.append(hulls_tile_gdf)
-
-    if hulls_best:
-        hulls_best = pd.concat(hulls_best, ignore_index=True)
-        hulls_best = gpd.GeoDataFrame(hulls_best, geometry="geometry", crs=project_crs)
-
-        # Save to file only if hulls_best is not empty
-        if not hulls_best.empty:
-            hulls_best.to_file("data/debug/hulls_best.gpkg")
-
-            # Reproject hulls_best to match the CRS of hulls
-            hulls_best = hulls_best.to_crs(hulls.crs)
-
-            # Get unique hull IDs
-            hulls_best_ids = hulls_best["hull_id"].unique()
-
-            # Perform the geometric difference
-            hulls["geometry"] = hulls.geometry.apply(lambda geom: geom.difference(hulls_best.buffer(0.5).union_all()))
+    # Subtract best clips from original hulls
+    if best_clips:
+        best = gpd.GeoDataFrame(pd.concat(best_clips, ignore_index=True), crs=PROJECT_CRS)
+        best.to_file("data/debug/hulls_best.gpkg")
+        diff = best.to_crs(hulls.crs).buffer(0.5).union_all()
+        hulls.geometry = hulls.geometry.apply(lambda g: g.difference(diff))
     else:
-        # If hulls_best is empty, just pass the original geometries
-        hulls_best_ids = []
-        print("hulls_best is empty, no difference calculation performed.")
-    # Remove any empty geometries resulting from the operation
-    hulls = hulls[hulls.geometry.is_empty == False]
+        best = gpd.GeoDataFrame(columns=hulls.columns, crs=PROJECT_CRS)
 
+    hulls = hulls[~hulls.geometry.is_empty]
     hulls.to_file("data/debug/hulls_remains.gpkg")
 
-    hulls_remainc = []
-
+    # Second pass: clip what's left
+    rem_clips = []
+    best_ids = set(best["hull_id"])
     for _, tile in tile_df.iterrows():
-        tile_name = tile["tile_name"]
-        tile_bounds = tile["bounds"]
-        tile_crs = tile["crs"]
+        name, bounds, crs = tile["tile_name"], tile["bounds"], tile["crs"]
+        in_crs = hulls.to_crs(crs)
+        poly = gpd.GeoDataFrame({"geometry": [bounds]}, crs=crs)
+        clipped = gpd.overlay(in_crs, poly, how="intersection")
+        keep = []
+        for _, part in clipped.iterrows():
+            orig = hulls.loc[part["hull_id"]]
+            a = part.geometry.area
+            pct = (a / orig["area"] * 100) if orig["area"] > 0 else 0
+            part["areac"] = int(a)
+            part["areap"] = round(pct, 2)
+            if part["hull_id"] in best_ids or pct > 99.9:
+                part["tile_sample"] = name
+                keep.append(part)
+        if keep:
+            df = pd.DataFrame(keep)
+            gdf = gpd.GeoDataFrame(df, geometry="geometry", crs=crs)
+            rem_clips.append(gdf.to_crs(PROJECT_CRS))
 
-        # Ensure hulls are in the tile CRS
-        hulls_in_tile_crs = hulls.to_crs(tile_crs)
-
-        # Clip hulls to the tile bounds
-        tile_polygon = gpd.GeoDataFrame({"geometry": [tile_bounds]}, crs=tile_crs)
-        clipped_hulls = gpd.overlay(hulls_in_tile_crs, tile_polygon, how="intersection")
-
-        hulls_tile = []
-
-        # Loop through the clipped hulls
-        for idx, clipped_hull in clipped_hulls.iterrows():
-            original_hull = hulls.loc[clipped_hull["hull_id"]]
-
-            areac = clipped_hull.geometry.area
-            areap = areac / original_hull["area"] if original_hull["area"] > 0 else 0
-
-            clipped_hull["areac"] = int(areac)
-            clipped_hull["areap"] = round(areap * 100, 2)
-
-            if clipped_hull["hull_id"] in hulls_best_ids:
-                # Add the processed hull to the list
-                clipped_hull["tile_sample"] = tile_name
-                hulls_tile.append(clipped_hull)
-
-            if clipped_hull["areap"] > 99.9:
-                # Add the processed hull to the list
-                clipped_hull["tile_sample"] = tile_name
-                hulls_tile.append(clipped_hull)
-
-        # Combine all processed hulls into a new GeoDataFrame
-        hulls_tile = pd.DataFrame(hulls_tile)
-        if hulls_tile.empty:
-            continue
-
-        hulls_tile_gdf = gpd.GeoDataFrame(hulls_tile, geometry="geometry", crs=tile_crs)
-        hulls_tile_gdf = hulls_tile_gdf.to_crs(project_crs)
-
-        hulls_remainc.append(hulls_tile_gdf)
-    if len(hulls_remainc) > 0:
-        hulls_remainc = pd.concat(hulls_remainc, ignore_index=True)
-        hulls_remainc = gpd.GeoDataFrame(hulls_remainc, geometry="geometry", crs=project_crs)
-
-        hulls_remainc.to_file("data/debug/hulls_remain_clipped.gpkg")
-        return gpd.GeoDataFrame(pd.concat([hulls_best, hulls_remainc], ignore_index=True))
-    else:
-        return hulls_best
+    if rem_clips:
+        rem = gpd.GeoDataFrame(pd.concat(rem_clips, ignore_index=True), crs=PROJECT_CRS)
+        rem.to_file("data/debug/hulls_remain_clipped.gpkg")
+        return gpd.GeoDataFrame(pd.concat([best, rem], ignore_index=True))
+    return best
 
 
 def mask_raster_with_polygon_and_recode(tile_name, raster_path, polygon_gdf):
     """
-    Masks the raster using polygons and recodes pixel values, but only for rows in
-    polygon_gdf where the 'tile_sample' column matches the given tile_name.
+    Mask a binary raster with polygons (for this tile_name), then recode:
+     1→1, 0→2. Returns (array, transform, crs).
     """
     with rasterio.open(raster_path) as src:
-        raster = src.read(1)
-        raster_meta = src.meta.copy()
-
-        # Filter polygons for the matching tile_name
-        matching_polygons = polygon_gdf[polygon_gdf["tile_sample"] == tile_name]
-
-        # If no matching polygons, return an empty masked raster
-        if matching_polygons.empty:
-            return np.zeros_like(raster), src.transform, src.crs
-
-        # Reproject polygons to match the raster CRS
-        matching_polygons = matching_polygons.to_crs(src.crs)
-
-        # Extract geometries for masking
-        polygons = [geometry for geometry in matching_polygons.geometry]
-
-        # Create mask
-        mask = geometry_mask(
-            polygons,
-            transform=src.transform,
-            invert=True,
-            out_shape=raster.shape,
-            all_touched=True,
-        )
-
-        # Initialize masked raster
-        masked_raster = np.zeros_like(raster)
-
-        # Perform recoding only for matching tiles
-        masked_raster[mask & (raster == 1)] = 1
-        masked_raster[mask & (raster == 0)] = 2
-
-    return masked_raster, src.transform, src.crs
+        arr = src.read(1)
+        trans = src.transform
+        crs = src.crs
+        polys = polygon_gdf[polygon_gdf["tile_sample"] == tile_name]
+        if polys.empty:
+            return np.zeros_like(arr), trans, crs
+        polys = polys.to_crs(crs)
+        mask = geometry_mask(polys.geometry, transform=trans, invert=True, out_shape=arr.shape, all_touched=True)
+        out = np.zeros_like(arr)
+        out[mask & (arr == 1)] = 1
+        out[mask & (arr == 0)] = 2
+    return out, trans, crs
 
 
-def clean_narrow_parts(gdf, min_width=10):
+def raster_to_point_gdf(masked, transform, crs):
     """
-    Remove narrow parts of polygons in a GeoDataFrame.
-
-    Parameters:
-    - gdf: GeoDataFrame with polygon geometries.
-    - min_width: Minimum width to retain, in the same units as the GeoDataFrame's CRS.
-
-    Returns:
-    - GeoDataFrame with cleaned geometries.
+    Convert masked array to points with CD field (1 or 2).
     """
-    half_width = min_width / 2
-    gdf["geometry"] = gdf["geometry"].apply(
-        lambda geom: geom.buffer(half_width).buffer(-half_width) if geom.is_valid else geom.buffer(0)
-    )
-    return gdf
-
-
-def raster_to_point_gdf(masked_raster, transform, crs):
-    """Converts raster data to a GeoDataFrame of points."""
-    rows, cols = np.where((masked_raster == 1) | (masked_raster == 2))
-    pixel_values = masked_raster[rows, cols]
-    coords = [rasterio.transform.xy(transform, row, col) for row, col in zip(rows, cols)]
-    points = [Point(x, y) for x, y in coords]
-    data = {"geometry": points, "CD": pixel_values}
-    return gpd.GeoDataFrame(data, crs=crs)
+    rows, cols = np.where((masked == 1) | (masked == 2))
+    vals = masked[rows, cols]
+    coords = [rasterio.transform.xy(transform, r, c) for r, c in zip(rows, cols)]
+    pts = [Point(x, y) for x, y in coords]
+    return gpd.GeoDataFrame({"geometry": pts, "CD": vals}, crs=crs)
 
 
 def sample_raster_with_points(raster_path, points_gdf, clc_key):
-    """Samples raster values at the locations specified in the point GeoDataFrame."""
+    """
+    Sample LULC raster at each point, write result into clc_key column.
+    """
     with rasterio.open(raster_path) as src:
-        points_gdf = points_gdf.to_crs(src.crs)
-        raster_values = [val[0] for point in points_gdf.geometry for val in src.sample([(point.x, point.y)])]
-    points_gdf[clc_key] = raster_values
-    points_gdf = points_gdf.to_crs(project_crs)
-    return points_gdf
+        pts = points_gdf.to_crs(src.crs)
+        vals = [v[0] for pt in pts.geometry for v in src.sample([(pt.x, pt.y)])]
+    points_gdf[clc_key] = vals
+    return points_gdf.to_crs(PROJECT_CRS)
 
 
 def compute_statistics_by_hull_id(points_gdf, clc_key):
     """
-    Computes statistics by `hull_id` where:
-    - If CD = 1, count up a new field called CD_$rastervalue.
-    - If CD = 2, count up a new field called VAL_$rastervalue.
-    Aggregates these counts by `hull_id`.
-
-    Parameters:
-        points_gdf (GeoDataFrame): A GeoDataFrame with fields "CD", "raster_value", and "hull_id".
-
-    Returns:
-        DataFrame: A DataFrame with aggregated statistics by `hull_id`.
+    For each hull_id group:
+      - count {clc_key}_CD_val where CD==1
+      - count {clc_key}_VAL_val for all points
+    Shows a tqdm bar for hulls.
     """
-    # Ensure input fields exist
-    required_fields = ["CD", clc_key, "hull_id"]
-    for field in required_fields:
-        if field not in points_gdf.columns:
-            raise ValueError(f"Missing required field '{field}' in points GeoDataFrame.")
+    for fld in ["CD", clc_key, "hull_id"]:
+        if fld not in points_gdf:
+            raise ValueError(f"{fld} missing")
 
-    # Define a function to calculate the statistics for each hull_id group
-    def calculate_group_stats(group, clc_key):
-        stats = {}
-        val_counts = {}  # Temporary dictionary to accumulate VAL counts
-
-        for _, row in group.iterrows():
-            if row["CD"] == 1:
-                # Count for CD
-                key_cd = f"{clc_key}_CD_{row[clc_key]}"
-                stats[key_cd] = stats.get(key_cd, 0) + 1
-
-            # Accumulate VAL counts for all raster_value
-            key_val = f"{clc_key}_VAL_{row[clc_key]}"
-            val_counts[key_val] = val_counts.get(key_val, 0) + 1
-
-        # Add accumulated VAL counts to stats
-        stats.update(val_counts)
-
-        return stats
-
-    # Group by `hull_id` and apply the stats function
     grouped = points_gdf.groupby("hull_id")
     stats_list = []
-    for hull_id, group in grouped:
-        stats = calculate_group_stats(group, clc_key)
+    for hull_id, group in tqdm(grouped, desc=f"Stats {clc_key}", total=grouped.ngroups, unit="hull"):
+        stats = {}
+        for _, row in group.iterrows():
+            if row["CD"] == 1:
+                key_cd = f"{clc_key}_CD_{row[clc_key]}"
+                stats[key_cd] = stats.get(key_cd, 0) + 1
+            key_val = f"{clc_key}_VAL_{row[clc_key]}"
+            stats[key_val] = stats.get(key_val, 0) + 1
         stats["hull_id"] = hull_id
         stats_list.append(stats)
 
-    # Convert list of dictionaries into a DataFrame
-    stats_df = pd.DataFrame(stats_list).fillna(0)
-    return stats_df
+    return pd.DataFrame(stats_list).fillna(0)
 
 
-def drop_duplicate_columns_from_dict(dataframes_dict):
-    seen_columns = set()
-    updated_dataframes_dict = {}
-
-    for key, df in dataframes_dict.items():
-        if not updated_dataframes_dict:  # For the first DataFrame
-            updated_dataframes_dict[key] = df
-            seen_columns.update(df.columns)
+def drop_duplicate_columns_from_dict(dfs):
+    seen, out = set(), {}
+    for k, df in dfs.items():
+        if not out:
+            out[k] = df
+            seen.update(df.columns)
         else:
-            # Retain only columns not seen before
-            unique_columns = [col for col in df.columns if col not in seen_columns]
-            updated_dataframes_dict[key] = df[unique_columns]
-            seen_columns.update(df.columns)
-
-    return updated_dataframes_dict
+            uniq = [c for c in df.columns if c not in seen]
+            out[k] = df[uniq]
+            seen.update(df.columns)
+    return out
 
 
-def combine_clc_statistics(all_clc_results):
-    """Combine CLC statistics into a single GeoDataFrame with both clc100 and clc10 columns."""
-    merged_result = None
-    all_clc_results = drop_duplicate_columns_from_dict(all_clc_results)
-    for clc_key, result_gdf in all_clc_results.items():
-        if merged_result is None:
-            merged_result = result_gdf
-        else:
-            # Merge on the polygon geometry or a unique ID (if available)
-            merged_result = merged_result.merge(
-                result_gdf,  # Drop geometry to avoid duplicate columns
-                left_index=True,
-                right_index=True,
-                how="outer",
-                suffixes=("", f"_{clc_key}"),
-            )
-    return merged_result
+def combine_clc_statistics(all_results):
+    merged = None
+    clean = drop_duplicate_columns_from_dict(all_results)
+    for df in clean.values():
+        merged = df if merged is None else merged.merge(df, left_index=True, right_index=True, how="outer")
+    return merged
 
 
-# Function to parse command-line arguments
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Process CLC data for a list of countries.")
-    parser.add_argument(
-        "--countries",
-        type=str,
-        required=True,
-        help="Comma-separated list of countries to process (e.g., 'austria,france').",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Process CLC data for specified countries.")
+    p.add_argument("--countries", type=str, required=True, help="Comma-separated list, e.g. austria,france")
+    return p.parse_args()
 
 
 def clean_and_sort(hulls):
-    # Rename columns only if they exist
-    if "cluster" not in hulls.columns:
-        if "cls_new" in hulls.columns:
-            hulls.rename(columns={"cls_new": "cluster"}, inplace=True)
-
-    if "buffer" not in hulls.columns:
-        if "buf_new" in hulls.columns:
-            hulls.rename(columns={"buf_new": "buffer"}, inplace=True)
-
-    # Drop columns only if they exist
-    columns_to_drop = ["split_area", "original_area", "area_percentage"]
-    existing_columns_to_drop = [col for col in columns_to_drop if col in hulls.columns]
-    hulls.drop(columns=existing_columns_to_drop, inplace=True)
-
-    # Separate columns into `clc` columns and others
-    clc_columns = [col for col in hulls.columns if col.startswith("clc")]
-    other_columns = [col for col in hulls.columns if not col.startswith("clc")]
-
-    # Sort `clc` columns with the correct order
-    sorted_clc_columns = sorted(
-        clc_columns,
-        key=lambda x: (
-            x.split("_")[0],  # First segment (e.g., clc100, clc10)
-            int(x.split("_")[-1]),  # Last segment (numerical value)
-            x.split("_")[1],  # Middle segment (e.g., VAL before CD)
-        ),
+    if "cluster" not in hulls and "cls_new" in hulls:
+        hulls.rename(columns={"cls_new": "cluster"}, inplace=True)
+    if "buffer" not in hulls and "buf_new" in hulls:
+        hulls.rename(columns={"buf_new": "buffer"}, inplace=True)
+    drops = [c for c in ["split_area", "original_area", "area_percentage"] if c in hulls]
+    hulls.drop(columns=drops, inplace=True)
+    clc_cols = sorted(
+        [c for c in hulls if c.startswith("clc")],
+        key=lambda x: (x.split("_")[0], int(x.split("_")[-1]), x.split("_")[1]),
     )
-
-    # Combine sorted columns
-    sorted_columns = other_columns + sorted_clc_columns
-
-    # Reorder DataFrame
-    hulls = hulls[sorted_columns]
-    return hulls
+    others = [c for c in hulls if not c.startswith("clc")]
+    return hulls[others + clc_cols]
 
 
-# Main script
 def main():
     args = parse_arguments()
     countries = args.countries.split(",")
+
     for country in countries:
-        for dataset in datasets:
-            capitalized_country = country.capitalize()
-            cdtile_path = f"data/CDTiles/{capitalized_country}/"
-            gpkg_path = f"data/03_outraster/{country.lower()}/{country.lower()}_{dataset}.gpkg"
-            output_gdf_path = f"data/04_clc/{country.lower()}/{country.lower()}_{dataset}.gpkg"
+        for ds in DATASETS:
+            cap = country.capitalize()
+            tile_dir = f"data/CDTiles/{cap}/"
+            in_gpkg = f"data/03_outraster/{country}/{country}_{ds}.gpkg"
+            out_gpkg = f"data/04_clc/{country}/{country}_{ds}.gpkg"
+            os.makedirs(os.path.dirname(out_gpkg), exist_ok=True)
 
-            # Ensure output directory exists
-            output_dir = os.path.dirname(output_gdf_path)
-            os.makedirs(output_dir, exist_ok=True)
+            if DEBUG:
+                print(f"Processing {country}/{ds}")
 
-            samplelayer = "convexhulls"
-            layers = ["bufferpolys", "concavehulls", "convexhulls"]
+            # Read tile metadata and build a GeoDataFrame of tile polygons in PROJECT_CRS
+            tiles = read_raster_bounds(tile_dir)
+            tpolys = []
+            for _, t in tiles.iterrows():
+                gdf = gpd.GeoDataFrame({"channel": [t["channel"]]}, geometry=[t["bounds"]], crs=t["crs"])
+                tpolys.append(gdf.to_crs(PROJECT_CRS))
+            tile_polys = gpd.GeoDataFrame(pd.concat(tpolys, ignore_index=True), crs=PROJECT_CRS)
 
-            if debug:
-                print(f"Processing country: {country}, dataset: {dataset}")
-                print(f"Reading raster bounds from: {cdtile_path}")
+            # Process hulls
+            hulls = gpd.read_file(in_gpkg, layer=SAMPLE_LAYER)
+            combined = process_hulls_and_tiles(hulls, tiles)
 
-            # Read raster bounds
-            tile_df = read_raster_bounds(cdtile_path)
-
-            if debug:
-                print(f"Found {len(tile_df)} tiles in {cdtile_path}")
-
-            # Process each layer
-            # Load hulls for the current layer
-            hulls = gpd.read_file(gpkg_path, layer=samplelayer)
-            # hulls_file = 'data/debug/hulls.gpkg'
-            # hulls.to_file(hulls_file, layer=samplelayer, driver="GPKG")
-
-            if debug:
-                print(f"Loaded {len(hulls)} polygons from layer: {samplelayer}")
-
-            # Process polygons and calculate differences
-            combined_hulls = process_hulls_and_tiles(hulls, tile_df)
-            # Iterate over CDTiles based on original filenames
-            all_points = []
-
-            for _, tile in tile_df.iterrows():
-                tile_name = tile["tile_name"]
-                raster_filename = next(
-                    (f for f in os.listdir(cdtile_path) if f.startswith(tile_name) & f.endswith("binary.tif")),
-                    None,
+            # Mask each tile, convert to points, tag with channel
+            pts_list = []
+            total_tiles = len(tiles)
+            for idx, t in enumerate(tiles.itertuples(index=False), start=1):
+                tname, chan = t.tile_name, t.channel
+                match = next(
+                    (f for f in os.listdir(tile_dir) if f.startswith(tname) and f.endswith("binary.tif")), None
                 )
-
-                if not raster_filename:
-                    if debug:
-                        print(f"No matching raster file for tile: {tile_name}, skipping...")
+                if not match:
+                    if DEBUG:
+                        print(f"Skipping missing raster for tile {tname} ({idx}/{total_tiles})")
                     continue
 
-                cdtilefilepath = os.path.join(cdtile_path, raster_filename)
+                if DEBUG:
+                    print(f"Masking tile {idx}/{total_tiles}: {tname}, channel={chan}")
 
-                if debug:
-                    print(f"Processing tile: {tile_name} with raster: {raster_filename}")
-
-                # Mask raster with polygons and recode
-                masked_raster, transform, crs = mask_raster_with_polygon_and_recode(
-                    tile_name, cdtilefilepath, combined_hulls
-                )
-
-                # Convert masked raster to point GeoDataFrame
-                points_gdf = raster_to_point_gdf(masked_raster, transform, crs)
-
-                if points_gdf.empty:
-                    if debug:
-                        print(f"No points generated for tile: {tile_name}")
+                mr, tf, cr = mask_raster_with_polygon_and_recode(tname, os.path.join(tile_dir, match), combined)
+                pts = raster_to_point_gdf(mr, tf, cr)
+                if pts.empty:
                     continue
-                points_gdf = points_gdf.to_crs(project_crs)
+                pts = pts.to_crs(PROJECT_CRS)
+                pts["channel"] = chan
+                pts_list.append(pts)
 
-                all_points.append(points_gdf)
+            all_pts = gpd.GeoDataFrame(pd.concat(pts_list, ignore_index=True), crs=PROJECT_CRS)
 
-            if debug:
-                print(f"Finished processing all tiles for {country} - {dataset}")
+            # Sample CLC rasters
+            for key, info in CLC_FILES.items():
+                path = f"data/CLC/{info['file']}"
+                if DEBUG:
+                    print(f"Sampling {key}")
+                all_pts = sample_raster_with_points(path, all_pts, key)
 
-            all_points = gpd.GeoDataFrame(pd.concat(all_points, ignore_index=True))
+            # Write turbines layer with channel join
+            tur = gpd.read_file(in_gpkg, layer="turbines").to_crs(PROJECT_CRS)
+            tur = gpd.sjoin(tur, tile_polys[["channel", "geometry"]], how="left", predicate="within").drop(
+                columns=["index_right"]
+            )
+            tur.to_file(out_gpkg, layer="turbines", driver="GPKG")
 
-            # all_points = all_points.iloc[:100000]
+            # Process each polygon layer with tqdm
+            for lyr in tqdm(LAYERS, desc="Polygon layers", unit="layer"):
+                if DEBUG:
+                    print(f"Processing layer: {lyr}")
+                hs = gpd.read_file(in_gpkg, layer=lyr).to_crs(PROJECT_CRS)
+                hs["hull_id"] = hs.index
 
-            for clc_key, clc_data in clc_files.items():
-                lulcfile = f"data/CLC/{clc_data['file']}"
-                if debug:
-                    print(f"Sampling raster values from {lulcfile} for {clc_key}")
-                all_points = sample_raster_with_points(lulcfile, all_points, clc_key)
+                joined = gpd.sjoin(all_pts, hs[["hull_id", "geometry"]], how="left", predicate="within")
 
-            # all_points.to_file(output_gdf_path + "_points.gpkg", driver="GPKG")
-            turbines = gpd.read_file(gpkg_path, layer="turbines")
-            turbines.to_file(output_gdf_path, layer="turbines", driver="GPKG")
-
-            for layer in layers:
-                if debug:
-                    print(f"Processing layer: {layer}")
-                hulls = gpd.read_file(gpkg_path, layer=layer)
-                hulls["hull_id"] = hulls.index
-                hulls = hulls.to_crs(project_crs)
-                all_points = all_points.to_crs(project_crs)
-
-                joined_gdf = gpd.sjoin(
-                    all_points,
-                    hulls[["hull_id", "geometry"]],
-                    how="left",
-                    predicate="within",
-                )
+                # Compute stats per hull with per‐hull tqdm bars
                 all_stats = pd.DataFrame()
-                for clc_key, clc_data in clc_files.items():
-                    stats_df = compute_statistics_by_hull_id(joined_gdf, clc_key)
-                    if all_stats.empty:
-                        all_stats = stats_df
-                    else:
-                        all_stats = pd.merge(all_stats, stats_df, on="hull_id")
+                for key in CLC_FILES:
+                    df = compute_statistics_by_hull_id(joined, key)
+                    all_stats = df if all_stats.empty else all_stats.merge(df, on="hull_id")
 
-                clc_results = hulls.merge(all_stats, on="hull_id", how="left").fillna(0)
+                # Determine modal channel per hull
+                channel_df = (
+                    joined.groupby("hull_id")["channel"]
+                    .agg(lambda x: x.mode()[0] if not x.mode().empty else "")
+                    .reset_index()
+                )
 
-                if debug:
-                    print(f"Saving processed results for layer: {layer} to {output_gdf_path}")
-                clc_results["area"] = clc_results.geometry.area.astype(int)
-                clc_results = clean_and_sort(clc_results)
-                # print(clc_results.columns)
-                clc_results.to_file(output_gdf_path, layer=layer, driver="GPKG")
+                out = hs.merge(all_stats, on="hull_id", how="left").fillna(0)
+                out = out.merge(channel_df, on="hull_id", how="left")
+                out["channel"] = out["channel"].fillna("")
+                out["area"] = out.geometry.area.astype(int)
+                out = clean_and_sort(out)
+                out.to_file(out_gpkg, layer=lyr, driver="GPKG")
 
 
 if __name__ == "__main__":
