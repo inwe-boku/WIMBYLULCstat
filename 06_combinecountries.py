@@ -1,251 +1,209 @@
-import glob
-import os
+#!/usr/bin/env python3
+"""
+Aggregate CLC-based statistics for turbine hull layers across countries and datasets.
 
-import fiona
+This script:
+- Reads processed GeoPackages containing CLC-enriched polygon layers.
+- Loads CLC lookup tables from an Excel file.
+- Reads detailed turbine attributes from a point dataset.
+- Joins nearest point attributes to turbines (within MAX_DISTANCE).
+- Summarizes point attributes within polygons (mean for numeric, first for categorical), or nearest if none inside.
+- Computes CLC class statistics per polygon layer.
+- Exports both GeoPackage layers (with per-feature VAL/CD sums, scaled ×100, and turbine attributes) and per-country Excel reports.
+
+Usage:
+    python process_clc_stats.py [--countries austria,france]
+"""
+
+import argparse
+import os
+import re
+from typing import Dict, List, Optional
+
 import geopandas as gpd
 import pandas as pd
+from tqdm import tqdm
+
+# -----------------------------------------------------------------------------
+# Configuration (override via CLI)
+# -----------------------------------------------------------------------------
+PROJECT_CRS = "EPSG:3035"
+INPUT_DIR = "data/04_clc"
+OUTPUT_DIR = "data/05_stat"
+CLC_LOOKUP = "data/CLC/CLC.xlsx"
+DATASETS = ["new", "old", "all"]
+POLY_LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
+CLC_TYPES = ["clc100", "clc10"]
+TURB_POINT_GPKG = "data/00_processedturbines/complete_all.gpkg"
+MAX_DISTANCE = 2500  # maximum search distance (in meters) for nearest turbine info
+RESULT_FIELDS = ["area", "carea", "careap", "ashare"]
 
 
-def read_multi_layer_gpkg(file_path):
-    """
-    Reads all layers from a GPKG and returns a dict: {layer_name: GeoDataFrame}.
-    """
-    gdf_dict = {}
-    layers = fiona.listlayers(file_path)
-    for layer in layers:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compute CLC statistics for turbine hulls per country and dataset.")
+    parser.add_argument(
+        "--countries",
+        type=str,
+        help="Comma-separated list of country folder names to process (overrides auto-detection).",
+    )
+    return parser.parse_args()
+
+
+def get_countries(base_dir: str, override: Optional[List[str]] = None) -> List[str]:
+    if override:
+        return [c.strip() for c in override]
+    try:
+        entries = os.listdir(base_dir)
+    except FileNotFoundError:
+        return []
+    return sorted([d for d in entries if os.path.isdir(os.path.join(base_dir, d))])
+
+
+def load_clc_lookup(path: str) -> Dict[str, pd.DataFrame]:
+    lookup: Dict[str, pd.DataFrame] = {}
+    for clc in CLC_TYPES:
         try:
-            gdf = gpd.read_file(file_path, layer=layer)
-            gdf_dict[layer] = gdf
-        except Exception as e:
-            print(f"Error reading layer='{layer}' in '{file_path}': {e}")
-    return gdf_dict
+            df = pd.read_excel(path, sheet_name=clc)
+            if "Category" in df.columns and "CatName" in df.columns:
+                df["CatName"] = df.groupby("Category")["CatName"].ffill()
+            lookup[clc] = df
+        except Exception:
+            lookup[clc] = pd.DataFrame()
+    return lookup
 
 
-def write_multi_layer_gpkg(gdf_dict, out_gpkg_path):
-    """
-    Write a dictionary of {layer_name: GeoDataFrame} to a single multi-layer GPKG file.
-    Overwrites if it already exists.
-    """
-    if os.path.exists(out_gpkg_path):
-        os.remove(out_gpkg_path)
+def compute_stats_for_layer(poly_gdf: gpd.GeoDataFrame, clc_type: str, lookup_df: pd.DataFrame) -> pd.DataFrame:
+    val_pattern = re.compile(rf"^{clc_type}_VAL_(\d+)$")
+    cd_pattern = re.compile(rf"^{clc_type}_CD_(\d+)$")
 
-    for layer_name, gdf in gdf_dict.items():
-        if gdf.empty:
+    val_cols = [c for c in poly_gdf.columns if val_pattern.match(c)]
+    cd_cols = [c for c in poly_gdf.columns if cd_pattern.match(c)]
+
+    total_val = poly_gdf[val_cols].sum() if val_cols else pd.Series(dtype=int)
+    total_cd = poly_gdf[cd_cols].sum() if cd_cols else pd.Series(dtype=int)
+
+    total_val_sum = int(total_val.sum())
+    total_cd_sum = int(total_cd.sum())
+
+    rows = []
+    for col in sorted(total_val.index):
+        val = int(val_pattern.match(col).group(1))
+        area = int(total_val[col])
+        carea = int(total_cd.get(col.replace("VAL", "CD"), 0))
+        careap = round(carea / area * 100, 2) if area > 0 else 0
+        ashare = round(area / total_val_sum * 100, 2) if total_val_sum > 0 else 0
+        rows.append({
+            "Value": val,
+            "area": area,
+            "carea": carea,
+            "careap": careap,
+            "ashare": ashare,
+        })
+
+    stats_df = pd.DataFrame(rows).set_index("Value")
+
+    if "Value" in lookup_df:
+        vals = lookup_df["Value"].dropna().astype(int).unique()
+        stats_df = stats_df.reindex(vals, fill_value=0)
+
+    stats_df[f"{clc_type}_VAL_sum"] = total_val_sum
+    stats_df[f"{clc_type}_CD_sum"] = total_cd_sum
+
+    return stats_df
+
+
+def process_country(
+    country: str, args: argparse.Namespace, lookup: Dict[str, pd.DataFrame], point_gdf: gpd.GeoDataFrame
+) -> None:
+    in_dir = os.path.join(INPUT_DIR, country)
+    out_gpkg_dir = os.path.join(OUTPUT_DIR, "gpkg")
+    out_xls_dir = os.path.join(OUTPUT_DIR, "xls")
+    os.makedirs(out_gpkg_dir, exist_ok=True)
+    os.makedirs(out_xls_dir, exist_ok=True)
+
+    for ds in DATASETS:
+        src_path = os.path.join(in_dir, f"{country}_{ds}.gpkg")
+        if not os.path.exists(src_path):
             continue
-        gdf.to_file(out_gpkg_path, layer=layer_name, driver="GPKG")
 
+        # Read input turbines & polygons
+        gdf_turb = gpd.read_file(src_path, layer="turbines").to_crs(PROJECT_CRS)
+        polys = {ly: gpd.read_file(src_path, layer=ly).to_crs(PROJECT_CRS) for ly in POLY_LAYERS}
 
-def save_feather_files(gdf_dict, out_dir, prefix=""):
-    """
-    For each layer in gdf_dict, save the attribute table (dropped geometry) as a Feather file.
-    The filename is '{prefix}{layer_name}.feather'.
-    """
-    os.makedirs(out_dir, exist_ok=True)
+        # 1) Join nearest turbine-point info onto turbines
+        attrs = ["hubheight", "diameter", "rpower", "model", "cdate"]
+        turb_pts = gpd.sjoin_nearest(
+            gdf_turb, point_gdf[attrs + ["geometry"]], how="left", max_distance=MAX_DISTANCE, distance_col="_dist"
+        )
+        for a in attrs:
+            gdf_turb[a] = turb_pts[a]
 
-    for layer_name, gdf in gdf_dict.items():
-        # Drop geometry
-        df_no_geom = gdf.drop(columns="geometry", errors="ignore").fillna(0)
-        df_no_geom = df_no_geom[sorted(df_no_geom.columns)]
+        # 2) For each polygon layer: aggregate point attrs
+        for ly, gdf in polys.items():
+            joined = gpd.sjoin(point_gdf, gdf[["geometry"]], how="inner", predicate="within")
+            grp = joined.groupby(joined.index_right)
+            means = grp[["hubheight", "diameter", "rpower"]].mean()
+            firsts = grp[["model", "cdate"]].first()
+            gdf = gdf.join(means).join(firsts)
+            empty = gdf[means.columns].isna().all(axis=1)
+            if empty.any():
+                near = gpd.sjoin_nearest(
+                    gdf[empty],
+                    point_gdf[attrs + ["geometry"]],
+                    how="left",
+                    max_distance=MAX_DISTANCE,
+                    distance_col="_dist2",
+                )
+                for a in attrs:
+                    gdf.loc[empty, a] = near[a].values
+            polys[ly] = gdf
 
-        # Convert object columns to string
-        for col in df_no_geom.select_dtypes(include=["object"]).columns:
-            df_no_geom[col] = df_no_geom[col].astype(str)
+        # 3) Add per-feature VAL/CD sums and scale
+        for ly, gdf in polys.items():
+            for clc in CLC_TYPES:
+                cd_cols = [c for c in gdf.columns if c.startswith(f"{clc}_CD_")]
+                val_cols = [c for c in gdf.columns if c.startswith(f"{clc}_VAL_")]
+                gdf[f"{clc}_CD_sum"] = gdf[cd_cols].sum(axis=1).astype(int) if cd_cols else 0
+                gdf[f"{clc}_VAL_sum"] = gdf[val_cols].sum(axis=1).astype(int) if val_cols else 0
+                for col in [*cd_cols, *val_cols, f"{clc}_CD_sum", f"{clc}_VAL_sum"]:
+                    gdf[col] = gdf[col] * 100
+            polys[ly] = gdf
 
-        # Write to Feather
-        feather_file = os.path.join(out_dir, f"{prefix}{layer_name}.feather")
-        df_no_geom.reset_index(drop=True).to_feather(feather_file, compression="zstd")
+        # Write fresh GeoPackage
+        out_gpkg = os.path.join(out_gpkg_dir, f"{country}_{ds}.gpkg")
+        if os.path.exists(out_gpkg):
+            os.remove(out_gpkg)
+        gdf_turb.to_file(out_gpkg, layer="turbines", driver="GPKG")
+        for ly in POLY_LAYERS:
+            polys[ly].to_file(out_gpkg, layer=ly, driver="GPKG", mode="a")
 
-
-def get_old_data(all_gdf, new_gdf, radius_for_points=0.0):
-    """
-    Return 'old' features from all_gdf that are not considered 'new' by:
-      - Points: within radius_for_points => considered 'new'.
-      - Polygons/others: intersects => considered 'new'.
-    """
-    if all_gdf.empty:
-        return all_gdf
-
-    # We assume geometry type is consistent for each layer
-    geom_type = all_gdf.geom_type.iloc[0]
-
-    if geom_type == "Point":
-        if new_gdf.empty:
-            # No new points => all are old
-            return all_gdf
-
-        # Mark any point as 'new' if it's within radius_for_points of ANY new point
-        def is_within_radius(all_feat):
-            return new_gdf.distance(all_feat.geometry).min() <= radius_for_points
-
-        mask = all_gdf.apply(is_within_radius, axis=1)
-        old_gdf = all_gdf.loc[~mask]
-
-    else:
-        # Polygons or lines => "new" if intersects any geometry in new_gdf
-        if new_gdf.empty:
-            return all_gdf
-
-        def intersects_new(all_feat):
-            return new_gdf.intersects(all_feat.geometry).any()
-
-        mask = all_gdf.apply(intersects_new, axis=1)
-        old_gdf = all_gdf.loc[~mask]
-
-    return old_gdf
-
-
-def process_country(new_file, all_file, output_dir, radius_for_points=0.0, verbose=False):
-    """
-    For a single country, read *new.gpkg and *all.gpkg:
-      1) read each into dict {layer_name: gdf}
-      2) compute 'old' for each layer
-      3) write 'new', 'all', 'old' each into a separate multi-layer GPKG
-      4) also write each layer's attribute table as Feather
-
-    Returns 3 dicts: (country_new_dict, country_all_dict, country_old_dict).
-    """
-    country_name = os.path.basename(new_file).split("_")[0]
-
-    # Read all layers
-    new_dict = read_multi_layer_gpkg(new_file)
-    all_dict = read_multi_layer_gpkg(all_file)
-    old_dict = {}
-
-    for layer_name, all_gdf in all_dict.items():
-        new_gdf = new_dict.get(layer_name, gpd.GeoDataFrame(columns=["geometry"]))
-        old_gdf = get_old_data(all_gdf, new_gdf, radius_for_points)
-        old_dict[layer_name] = old_gdf
-
-    # Write out multi-layer GPKG
-    country_out_dir = os.path.join(output_dir, country_name)
-    os.makedirs(country_out_dir, exist_ok=True)
-
-    new_gpkg = os.path.join(country_out_dir, f"{country_name}_new.gpkg")
-    all_gpkg = os.path.join(country_out_dir, f"{country_name}_all.gpkg")
-    old_gpkg = os.path.join(country_out_dir, f"{country_name}_old.gpkg")
-
-    write_multi_layer_gpkg(new_dict, new_gpkg)
-    write_multi_layer_gpkg(all_dict, all_gpkg)
-    write_multi_layer_gpkg(old_dict, old_gpkg)
-
-    # Also save each layer's attribute table as Feather
-    # (prefix them with new_, all_, old_)
-    save_feather_files(new_dict, country_out_dir, prefix="new_")
-    save_feather_files(all_dict, country_out_dir, prefix="all_")
-    save_feather_files(old_dict, country_out_dir, prefix="old_")
-
-    if verbose:
-        print(f"Processed country={country_name}, wrote {new_gpkg}, {all_gpkg}, {old_gpkg}")
-
-    return new_dict, all_dict, old_dict
-
-
-def combine_europe_data(europe_out_dir, all_countries_new, all_countries_all, all_countries_old, verbose=False):
-    """
-    Combine all countries' new/all/old data into 3 Europe-wide multi-layer GPKGs + Feather:
-      - europe_new.gpkg
-      - europe_all.gpkg
-      - europe_old.gpkg
-    each a multi-layer GPKG across all layers seen in the union of countries.
-    """
-    os.makedirs(europe_out_dir, exist_ok=True)
-
-    # For each "type" (new/all/old), gather by layer
-    # e.g. europe_new_dict[layer_name] = [gdfs from each country]
-    # Then we write one multi-layer file.
-
-    def merge_gdfs_by_layer(list_of_dicts):
-        """
-        list_of_dicts is a list of {layer: GeoDataFrame} from each country.
-        We produce a new dict {layer: merged_gdf} with all countries merged for each layer.
-        """
-        merged_dict = {}
-        # Collect all possible layer names
-        all_layer_names = set()
-        for dct in list_of_dicts:
-            all_layer_names.update(dct.keys())
-
-        for layer_name in all_layer_names:
-            # gather all country gdfs for this layer
-            part_gdfs = []
-            for dct in list_of_dicts:
-                if layer_name in dct:
-                    part_gdfs.append(dct[layer_name])
-            if part_gdfs:
-                merged_dict[layer_name] = gpd.GeoDataFrame(pd.concat(part_gdfs, ignore_index=True))
-            else:
-                merged_dict[layer_name] = gpd.GeoDataFrame(columns=["geometry"])
-        return merged_dict
-
-    # Merge them
-    europe_new = merge_gdfs_by_layer(all_countries_new)
-    europe_all = merge_gdfs_by_layer(all_countries_all)
-    europe_old = merge_gdfs_by_layer(all_countries_old)
-
-    # Write multi-layer GPKG
-    europe_new_gpkg = os.path.join(europe_out_dir, "europe_new.gpkg")
-    europe_all_gpkg = os.path.join(europe_out_dir, "europe_all.gpkg")
-    europe_old_gpkg = os.path.join(europe_out_dir, "europe_old.gpkg")
-
-    write_multi_layer_gpkg(europe_new, europe_new_gpkg)
-    write_multi_layer_gpkg(europe_all, europe_all_gpkg)
-    write_multi_layer_gpkg(europe_old, europe_old_gpkg)
-
-    # Write Feather
-    save_feather_files(europe_new, europe_out_dir, prefix="europe_new_")
-    save_feather_files(europe_all, europe_out_dir, prefix="europe_all_")
-    save_feather_files(europe_old, europe_out_dir, prefix="europe_old_")
-
-    if verbose:
-        print(f"Created {europe_new_gpkg}, {europe_all_gpkg}, {europe_old_gpkg}")
+        # Excel report
+        xls_path = os.path.join(out_xls_dir, f"{country}_{ds}.xlsx")
+        with pd.ExcelWriter(xls_path) as writer:
+            for clc in CLC_TYPES:
+                lookup_df = lookup.get(clc, pd.DataFrame())
+                if lookup_df.empty:
+                    continue
+                sheet_df = None
+                for ly in POLY_LAYERS:
+                    stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
+                    stats.columns = [f"{ly}_{c}" for c in stats.columns]
+                    sheet_df = stats if sheet_df is None else sheet_df.join(stats)
+                sheet_df.to_excel(writer, sheet_name=clc)
 
 
 def main():
-    # Adjust these paths as needed
-    input_directory = "data/05_stat/gpkg/"
-    output_directory = "data/06_combined/"
-    radius_for_points = 0.0  # 0 => exact match for Points
+    args = parse_args()
+    override = args.countries.split(",") if args.countries else None
+    countries = get_countries(INPUT_DIR, override)
+    if not countries:
+        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+        return
 
-    # We expect pairs: <country>_new.gpkg, <country>_all.gpkg
-    new_files = sorted(glob.glob(os.path.join(input_directory, "*new.gpkg")))
-    all_files = sorted(glob.glob(os.path.join(input_directory, "*all.gpkg")))
-
-    # We will store the dictionaries from each country to combine for Europe
-    all_countries_new_dicts = []
-    all_countries_all_dicts = []
-    all_countries_old_dicts = []
-
-    # Pair up the new/all GPKGs by matching country name
-    # (Assuming the same prefix and 1:1 mapping)
-    matched_pairs = []
-    for nf in new_files:
-        country = os.path.basename(nf).split("_")[0]
-        # Try to find a matching all-file for that country
-        # E.g. BEL_new.gpkg => BEL_all.gpkg
-        candidate = os.path.join(input_directory, f"{country}_all.gpkg")
-        if os.path.exists(candidate):
-            matched_pairs.append((nf, candidate))
-        else:
-            print(f"No matching '*all.gpkg' for '{nf}'")
-
-    for new_file, all_file in matched_pairs:
-        # Process the country, get (new_dict, all_dict, old_dict)
-        new_d, all_d, old_d = process_country(
-            new_file, all_file, output_dir=output_directory, radius_for_points=radius_for_points, verbose=True
-        )
-        all_countries_new_dicts.append(new_d)
-        all_countries_all_dicts.append(all_d)
-        all_countries_old_dicts.append(old_d)
-
-    # After all countries are done, combine each "type" (new, all, old) into Europe-level GPKGs
-    europe_out_dir = os.path.join(output_directory, "europe")
-    combine_europe_data(
-        europe_out_dir=europe_out_dir,
-        all_countries_new=all_countries_new_dicts,
-        all_countries_all=all_countries_all_dicts,
-        all_countries_old=all_countries_old_dicts,
-        verbose=True,
-    )
+    lookup = load_clc_lookup(CLC_LOOKUP)
+    point_gdf = gpd.read_file(TURB_POINT_GPKG).to_crs(PROJECT_CRS)
+    for country in tqdm(countries, desc="Countries"):
+        process_country(country, args, lookup, point_gdf)
 
 
 if __name__ == "__main__":
