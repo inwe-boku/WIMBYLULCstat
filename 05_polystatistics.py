@@ -197,11 +197,8 @@ def process_country(
                 for ly in POLY_LAYERS:
                     stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
                     stats.columns = [f"{ly}_{c}" for c in stats.columns]
-                    print(stats)
                     sheet_df = stats if sheet_df is None else sheet_df.join(stats)
-                    print(sheet_df)
                 sheet_df.to_excel(writer, sheet_name=clc)
-                exit(0)
 
 
 def main():
