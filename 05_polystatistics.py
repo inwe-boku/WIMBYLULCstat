@@ -128,21 +128,20 @@ def process_country(
         gdf_turb = gpd.read_file(src_path, layer="turbines").to_crs(PROJECT_CRS)
         polys = {ly: gpd.read_file(src_path, layer=ly).to_crs(PROJECT_CRS) for ly in POLY_LAYERS}
 
-        # Map point attributes to turbines (point-to-point)
+        # Map point attributes to turbines via nearest inner join within MAX_DISTANCE
         attrs = ["hubheight", "diameter", "rpower", "model", "cdate"]
-        turb_with_attrs = gpd.sjoin_nearest(
-            gdf_turb,
-            point_gdf[attrs + ["geometry"]],
-            how="left",
-            max_distance=MAX_DISTANCE,
-            distance_col="_dist",
-            lsuffix="",
-            rsuffix="_pt",
-        )
-        for a in attrs:
-            col_pt = f"{a}_pt"
-            if col_pt in turb_with_attrs:
-                gdf_turb[a] = turb_with_attrs[col_pt]
+        # prepare point layer with renamed attribute columns
+        pt = point_gdf[attrs + ["geometry"]].copy()
+        pt = pt.rename(columns={a: f"{a}_pt" for a in attrs})
+        # perform nearest join
+        turb_nearest = gpd.sjoin_nearest(gdf_turb, pt, how="inner", max_distance=MAX_DISTANCE, distance_col="_dist")
+        # keep original turbine columns + renamed point attributes
+        orig_cols = list(gdf_turb.columns)
+        pt_cols = [f"{a}_pt" for a in attrs]
+        gdf_turb = turb_nearest[orig_cols + pt_cols]
+        # remove '_pt' suffix from point attribute columns
+        rename_map = {f"{a}_pt": a for a in attrs}
+        gdf_turb = gdf_turb.rename(columns=rename_map)
 
         # Summarize point attributes within polygons
         for ly, gdf in polys.items():
@@ -159,13 +158,13 @@ def process_country(
                     how="left",
                     max_distance=MAX_DISTANCE,
                     distance_col="_dist2",
-                    lsuffix="",
+                    lsuffix="_poly",
                     rsuffix="_pt",
                 )
                 for a in attrs:
-                    col_pt = f"{a}_pt"
-                    if col_pt in near:
-                        gdf.loc[empty, a] = near[col_pt].values
+                    pt_col = f"{a}_pt"
+                    if pt_col in near.columns:
+                        gdf.loc[empty, a] = near[pt_col].values
             polys[ly] = gdf
 
         # Add per-feature VAL/CD sums and scale
@@ -198,8 +197,11 @@ def process_country(
                 for ly in POLY_LAYERS:
                     stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
                     stats.columns = [f"{ly}_{c}" for c in stats.columns]
+                    print(stats)
                     sheet_df = stats if sheet_df is None else sheet_df.join(stats)
+                    print(sheet_df)
                 sheet_df.to_excel(writer, sheet_name=clc)
+                exit(0)
 
 
 def main():
