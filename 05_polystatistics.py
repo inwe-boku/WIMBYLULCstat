@@ -9,10 +9,10 @@ This script:
 - Joins nearest point attributes to turbines (within MAX_DISTANCE).
 - Summarizes point attributes within polygons (mean for numeric, first for categorical), or nearest if none inside.
 - Computes CLC class statistics per polygon layer.
-- Exports both GeoPackage layers (with per-feature VAL/CD sums, scaled ×100, and turbine attributes) and per-country Excel reports.
+- Exports both GeoPackage layers and per-country Excel reports with detailed and summary sheets.
 
 Usage:
-    python process_clc_stats.py [--countries austria,france]
+    python process_clc_stats_refactored.py [--countries austria,france]
 """
 
 import argparse
@@ -36,7 +36,6 @@ POLY_LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
 CLC_TYPES = ["clc100", "clc10"]
 TURB_POINT_GPKG = "data/00_processedturbines/complete_all.gpkg"
 MAX_DISTANCE = 5000  # meters
-RESULT_FIELDS = ["area", "carea", "careap", "ashare"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +100,7 @@ def compute_stats_for_layer(poly_gdf: gpd.GeoDataFrame, clc_type: str, lookup_df
         })
 
     stats_df = pd.DataFrame(rows).set_index("Value")
-    if "Value" in lookup_df:
+    if "Value" in lookup_df.columns:
         vals = lookup_df["Value"].dropna().astype(int).unique()
         stats_df = stats_df.reindex(vals, fill_value=0)
 
@@ -110,50 +109,175 @@ def compute_stats_for_layer(poly_gdf: gpd.GeoDataFrame, clc_type: str, lookup_df
     return stats_df
 
 
+def process_gpkg(
+    country: str,
+    ds: str,
+    gdf_turb: gpd.GeoDataFrame,
+    polys: Dict[str, gpd.GeoDataFrame],
+    output_dir: str = OUTPUT_DIR,
+) -> None:
+    out_gpkg_dir = os.path.join(output_dir, "gpkg")
+    os.makedirs(out_gpkg_dir, exist_ok=True)
+    out_gpkg = os.path.join(out_gpkg_dir, f"{country}_{ds}.gpkg")
+    if os.path.exists(out_gpkg):
+        os.remove(out_gpkg)
+    gdf_turb.to_file(out_gpkg, layer="turbines", driver="GPKG")
+    for ly, gdf in polys.items():
+        gdf.to_file(out_gpkg, layer=ly, driver="GPKG", mode="a")
+
+
+def process_xls(
+    country: str,
+    ds: str,
+    polys: Dict[str, gpd.GeoDataFrame],
+    lookup: Dict[str, pd.DataFrame],
+    gdf_turb: gpd.GeoDataFrame,
+    output_dir: str = OUTPUT_DIR,
+) -> None:
+    out_xls_dir = os.path.join(output_dir, "xls")
+    os.makedirs(out_xls_dir, exist_ok=True)
+    xls_path = os.path.join(out_xls_dir, f"{country}_{ds}.xlsx")
+
+    with pd.ExcelWriter(xls_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        header_format = workbook.add_format({"text_wrap": True, "align": "center"})
+
+        # Detailed CLC sheets with multi-level header
+        for clc in CLC_TYPES:
+            lookup_df = lookup.get(clc, pd.DataFrame())
+            if lookup_df.empty:
+                continue
+            meta_cols = [c for c in lookup_df.columns if c != "Value"]
+            meta = lookup_df.set_index("Value")[meta_cols]
+            # build metrics MultiIndex
+            parts = []
+            for ly in POLY_LAYERS:
+                stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
+                core = stats[["area", "carea", "careap", "ashare"]].copy()
+                core.columns = pd.MultiIndex.from_product([[ly], core.columns])
+                parts.append(core)
+            df_detail = pd.concat(parts, axis=1)
+            # prepare output DataFrame combining meta and detail
+            meta.columns = pd.MultiIndex.from_product([[""], meta.columns])
+            df_out = pd.concat([meta, df_detail], axis=1)
+            # write with header rows at 0 (top-level) and 1 (metrics)
+            df_out.to_excel(writer, sheet_name=clc, startrow=0)
+            worksheet = writer.sheets[clc]
+            # set heights: top-level header row 0 and metrics row 1
+            worksheet.set_row(0, 30, header_format)
+            worksheet.set_row(1, 20, header_format)
+            # merge polytype cells in row 0
+            col_offset = len(meta_cols) + 1  # index column + meta cols
+            for i, ly in enumerate(POLY_LAYERS):
+                start = col_offset + i * 4
+                end = start + 3
+                # Merge only the top header row, ignore overlaps
+                try:
+                    worksheet.merge_range(0, start, 0, end, ly, header_format)
+                except Exception:
+                    pass
+            # Autofit columns for detailed sheet
+            for idx, col in enumerate(df_out.columns):
+                # skip index column (col index 0)
+                col_idx = idx + 1
+                # build header text
+                header = " ".join([str(x) for x in col if x])
+                max_len = len(header)
+                col_vals = df_out[col].astype(str)
+                if not col_vals.empty:
+                    max_len = max(max_len, col_vals.map(len).max())
+                worksheet.set_column(col_idx, col_idx, max_len + 2)
+
+                # Summary sheet with multiheaders for metrics and CLC values
+        from collections import OrderedDict
+
+        # Define metrics and their display names
+        metrics = OrderedDict([
+            ("total_turbines", "total turbines"),
+            ("num_windparks", "number of windparks"),
+            ("avg_turbines_per_concavehulls", "average turbines per windpark"),
+            ("avg_hubheight", "average hubheight"),
+            ("avg_diameter", "average diameter"),
+            ("avg_rpower", "average rpower"),
+        ])
+        # Compute metrics values
+        num_turbines = len(gdf_turb)
+        num_polys = len(polys["concavehulls"])
+        metric_vals = [
+            num_turbines,
+            num_polys,
+            num_turbines / num_polys if num_polys else 0,
+            float(gdf_turb["hubheight"].mean()),
+            float(gdf_turb["diameter"].mean()),
+            float(gdf_turb["rpower"].mean()),
+        ]
+        # Compute CLC VAL_sum values
+        clc_vals = []
+        for clc in CLC_TYPES:
+            for ly in POLY_LAYERS:
+                clc_vals.append(int(polys[ly][f"{clc}_VAL_sum"].sum()))
+        # Build MultiIndex columns: first 'Metrics' group then CLC groups
+        top = ["Metrics"] * len(metrics) + [clc for clc in CLC_TYPES for _ in POLY_LAYERS]
+        bottom = list(metrics.values()) + POLY_LAYERS * len(CLC_TYPES)
+        mindex = pd.MultiIndex.from_arrays([top, bottom])
+        # Assemble DataFrame
+        df_sum = pd.DataFrame([metric_vals + clc_vals], columns=mindex)
+        # Convert all summary values to integers
+        df_sum = df_sum.round(0).astype(int)
+        # Write and format, hide index
+        df_sum.to_excel(writer, sheet_name="summary", startrow=0)
+        ws = writer.sheets["summary"]
+        ws.set_column(0, 0, None, None, {"hidden": True})
+        # Set header row heights
+        ws.set_row(0, 30, header_format)
+        ws.set_row(1, 30, header_format)
+        # Autofit columns for summary sheet
+        for idx, col in enumerate(df_sum.columns):
+            col_idx = idx + 1
+            header = " ".join([str(x) for x in col if x])
+            max_len = len(header)
+            col_vals = df_sum[col].astype(str)
+            if not col_vals.empty:
+                max_len = max(max_len, col_vals.map(len).max())
+            ws.set_column(col_idx, col_idx, max_len + 2)
+        # Autofit columns for summary sheet
+        for idx, col in enumerate(df_sum.columns):
+            col_idx = idx + 1
+            header = " ".join([str(x) for x in col if x])
+            max_len = len(header)
+            col_vals = df_sum[col].astype(str)
+            if not col_vals.empty:
+                max_len = max(max_len, col_vals.map(len).max())
+            ws.set_column(col_idx, col_idx, max_len + 2)
+
+
 def process_country(
     country: str, args: argparse.Namespace, lookup: Dict[str, pd.DataFrame], point_gdf: gpd.GeoDataFrame
 ) -> None:
     in_dir = os.path.join(INPUT_DIR, country)
-    out_gpkg_dir = os.path.join(OUTPUT_DIR, "gpkg")
-    out_xls_dir = os.path.join(OUTPUT_DIR, "xls")
-    os.makedirs(out_gpkg_dir, exist_ok=True)
-    os.makedirs(out_xls_dir, exist_ok=True)
-
     for ds in DATASETS:
-        src_path = os.path.join(in_dir, f"{country}_{ds}.gpkg")
-        if not os.path.exists(src_path):
+        src = os.path.join(in_dir, f"{country}_{ds}.gpkg")
+        if not os.path.exists(src):
             continue
-
-        # Load turbines and polygons
-        gdf_turb = gpd.read_file(src_path, layer="turbines").to_crs(PROJECT_CRS)
-        polys = {ly: gpd.read_file(src_path, layer=ly).to_crs(PROJECT_CRS) for ly in POLY_LAYERS}
-
-        # Map point attributes to turbines via nearest inner join within MAX_DISTANCE
+        # load turbines and polygons
+        gdf_turb = gpd.read_file(src, layer="turbines").to_crs(PROJECT_CRS)
+        polys = {ly: gpd.read_file(src, layer=ly).to_crs(PROJECT_CRS) for ly in POLY_LAYERS}
+        # attach point attributes
         attrs = ["hubheight", "diameter", "rpower", "model", "cdate"]
-        # prepare point layer with renamed attribute columns
-        pt = point_gdf[attrs + ["geometry"]].copy()
-        pt = pt.rename(columns={a: f"{a}_pt" for a in attrs})
-        # perform nearest join
-        turb_nearest = gpd.sjoin_nearest(gdf_turb, pt, how="inner", max_distance=MAX_DISTANCE, distance_col="_dist")
-        # keep original turbine columns + renamed point attributes
+        pt = point_gdf[attrs + ["geometry"]].rename(columns={a: f"{a}_pt" for a in attrs})
+        tn = gpd.sjoin_nearest(gdf_turb, pt, how="inner", max_distance=MAX_DISTANCE, distance_col="_dist")
         orig_cols = list(gdf_turb.columns)
-        pt_cols = [f"{a}_pt" for a in attrs]
-        gdf_turb = turb_nearest[orig_cols + pt_cols]
-        # remove '_pt' suffix from point attribute columns
-        rename_map = {f"{a}_pt": a for a in attrs}
-        gdf_turb = gdf_turb.rename(columns=rename_map)
-
-        # Summarize point attributes within polygons
-        for ly, gdf in polys.items():
-            joined = gpd.sjoin(point_gdf, gdf[["geometry"]], how="inner", predicate="within")
+        gdf_turb = tn[orig_cols + [f"{a}_pt" for a in attrs]].rename(columns={f"{a}_pt": a for a in attrs})
+        # summarize within polygons
+        for ly in POLY_LAYERS:
+            g = polys[ly]
+            joined = gpd.sjoin(point_gdf, g[["geometry"]], how="inner", predicate="within")
             grp = joined.groupby(joined.index_right)
-            means = grp[["hubheight", "diameter", "rpower"]].mean()
-            firsts = grp[["model", "cdate"]].first()
-            gdf = gdf.join(means).join(firsts)
-            empty = gdf[means.columns].isna().all(axis=1)
-            if empty.any():
+            g = g.join(grp[["hubheight", "diameter", "rpower"]].mean()).join(grp[["model", "cdate"]].first())
+            mask = g[["hubheight", "diameter", "rpower"]].isna().all(axis=1)
+            if mask.any():
                 near = gpd.sjoin_nearest(
-                    gdf[empty],
+                    g[mask],
                     point_gdf[attrs + ["geometry"]],
                     how="left",
                     max_distance=MAX_DISTANCE,
@@ -162,43 +286,23 @@ def process_country(
                     rsuffix="_pt",
                 )
                 for a in attrs:
-                    pt_col = f"{a}_pt"
-                    if pt_col in near.columns:
-                        gdf.loc[empty, a] = near[pt_col].values
-            polys[ly] = gdf
-
-        # Add per-feature VAL/CD sums and scale
-        for ly, gdf in polys.items():
-            for clc in CLC_TYPES:
-                cd_cols = [c for c in gdf.columns if c.startswith(f"{clc}_CD_")]
-                val_cols = [c for c in gdf.columns if c.startswith(f"{clc}_VAL_")]
-                gdf[f"{clc}_CD_sum"] = gdf[cd_cols].sum(axis=1).astype(int) if cd_cols else 0
-                gdf[f"{clc}_VAL_sum"] = gdf[val_cols].sum(axis=1).astype(int) if val_cols else 0
-                for col in [*cd_cols, *val_cols, f"{clc}_CD_sum", f"{clc}_VAL_sum"]:
-                    gdf[col] = gdf[col] * 100
-            polys[ly] = gdf
-
-        # Write GeoPackage
-        out_gpkg = os.path.join(out_gpkg_dir, f"{country}_{ds}.gpkg")
-        if os.path.exists(out_gpkg):
-            os.remove(out_gpkg)
-        gdf_turb.to_file(out_gpkg, layer="turbines", driver="GPKG")
+                    if f"{a}_pt" in near.columns:
+                        g.loc[mask, a] = near[f"{a}_pt"].values
+            polys[ly] = g
+        # compute CLC sums in polygons
         for ly in POLY_LAYERS:
-            polys[ly].to_file(out_gpkg, layer=ly, driver="GPKG", mode="a")
-
-        # Write Excel report
-        xls_path = os.path.join(out_xls_dir, f"{country}_{ds}.xlsx")
-        with pd.ExcelWriter(xls_path) as writer:
+            g = polys[ly]
             for clc in CLC_TYPES:
-                lookup_df = lookup.get(clc, pd.DataFrame())
-                if lookup_df.empty:
-                    continue
-                sheet_df = None
-                for ly in POLY_LAYERS:
-                    stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
-                    stats.columns = [f"{ly}_{c}" for c in stats.columns]
-                    sheet_df = stats if sheet_df is None else sheet_df.join(stats)
-                sheet_df.to_excel(writer, sheet_name=clc)
+                cd_cols = [c for c in g.columns if c.startswith(f"{clc}_CD_")]
+                val_cols = [c for c in g.columns if c.startswith(f"{clc}_VAL_")]
+                g[f"{clc}_CD_sum"] = g[cd_cols].sum(axis=1).astype(int) if cd_cols else 0
+                g[f"{clc}_VAL_sum"] = g[val_cols].sum(axis=1).astype(int) if val_cols else 0
+                for c in cd_cols + val_cols + [f"{clc}_CD_sum", f"{clc}_VAL_sum"]:
+                    g[c] *= 100
+            polys[ly] = g
+        # export files
+        process_gpkg(country, ds, gdf_turb, polys)
+        process_xls(country, ds, polys, lookup, gdf_turb)
 
 
 def main():
@@ -208,7 +312,6 @@ def main():
     if not countries:
         print(f"No countries found in '{INPUT_DIR}'. Exiting.")
         return
-
     lookup = load_clc_lookup(CLC_LOOKUP)
     point_gdf = gpd.read_file(TURB_POINT_GPKG).to_crs(PROJECT_CRS)
     for country in tqdm(countries, desc="Countries"):
