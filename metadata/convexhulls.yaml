@@ -1,0 +1,65 @@
+identifier: "unique-resource-identifier"
+language: "en"
+characterSet: "utf-8"
+hierarchyLevel: "dataset"
+contact:
+  - organization: "Example Organization"
+    email: "info@example.org"
+    role: "pointOfContact"
+dateStamp: "2023-10-01"
+metadataStandardName: "INSPIRE"
+metadataStandardVersion: "2.0.1"
+dataSetURI: "http://example.org/dataset/unique-resource-identifier"
+spatialRepresentationType:
+  - "vector"
+referenceSystem:
+  - "EPSG:4326"
+title: "Example GeoPackage Layer"
+abstract: "This GeoPackage layer contains example spatial data for demonstration purposes."
+keywords:
+  - "GeoPackage"
+  - "spatial data"
+  - "example"
+topicCategory:
+  - "location"
+extent:
+  geographicElement:
+    westBoundLongitude: "-10.0"
+    eastBoundLongitude: "10.0"
+    southBoundLatitude: "40.0"
+    northBoundLatitude: "60.0"
+  temporalElement:
+    begin: "2023-01-01"
+    end: "2023-12-31"
+lineage: "The dataset was created by digitizing paper maps and validating the results with field surveys."
+responsibleParty:
+  - organization: "Example Organization"
+    email: "info@example.org"
+    role: "owner"
+usage:
+  specificUsage: "The dataset is intended for demonstration and educational purposes."
+constraints:
+  legalConstraints:
+    accessConstraints: "otherRestrictions"
+    otherConstraints: "License: CC BY 4.0"
+    useLimitation: "The data can be freely used, modified, and shared, even for commercial purposes, as long as the original source is attributed."
+dataQuality:
+  scope:
+    level: "dataset"
+  lineage:
+    statement: "The dataset was created by digitizing paper maps and validating the results with field surveys."
+  positionalAccuracy:
+    horizontalPositionalAccuracy:
+      result:
+        value: 5.0
+        uom: "meter"
+distribution:
+  - format:
+      name: "GeoPackage"
+      version: "1.2"
+    transferOptions:
+      online:
+        url: "http://example.org/downloads/example-geopackage.gpkg"
+        name: "Download GeoPackage"
+        description: "Direct download link for the GeoPackage file."
+        protocol: "WWW:DOWNLOAD-1.0-http--download"

@@ -1,0 +1,131 @@
+characterSet:
+  codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_CharacterSetCode
+  codeListValue: utf8
+contact:
+  contactInfo:
+    address:
+      electronicMailAddress: info@example.com
+  organisationName: Example Organisation
+  role:
+    codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_RoleCode
+    codeListValue: pointOfContact
+dataQualityInfo:
+  report:
+    domainConsistency:
+      result:
+        conformanceResult:
+          specification:
+            date:
+              date: '2010-12-08'
+              dateType:
+                codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_DateTypeCode
+                codeListValue: publication
+            explanation: This dataset is conformant with the INSPIRE Implementing
+              Rules for metadata and spatial data sets.
+            pass: true
+            title: Commission Regulation (EU) No 1089/2010 of 23 November 2010 implementing
+              Directive 2007/2/EC of the European Parliament and of the Council as
+              regards interoperability of spatial data sets and services
+  scope:
+    level:
+      codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#DQ_ScopeCode
+      codeListValue: dataset
+dateStamp: '2024-07-24'
+fileIdentifier: unique_file_identifier_12345
+hierarchyLevel:
+  codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_ScopeCode
+  codeListValue: dataset
+identificationInfo:
+  abstract: This GeoPackage contains example spatial data, including points, lines,
+    and polygons, for demonstration purposes.  It is compliant with the INSPIRE Directive.
+  citation:
+    date:
+      date: '2024-01-15'
+      dateType:
+        codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_DateTypeCode
+        codeListValue: publication
+    identifier:
+      code: example_dataset_id_001
+    title: Example GeoPackage Dataset
+  descriptiveKeywords:
+  - keyword: GeoPackage
+  - keyword: INSPIRE
+  - keyword: Spatial Data
+  - keyword: Point
+  - keyword: Line
+  - keyword: Polygon
+  - keyword: INSPIRE data theme
+    thesaurusName:
+      date:
+        date: '2008-06-01'
+        dateType:
+          codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_DateTypeCode
+          codeListValue: publication
+      title: INSPIRE Spatial Data Themes
+  extent:
+    geographicElement:
+      eastBoundLongitude: 25.0
+      northBoundLatitude: 70.0
+      southBoundLatitude: 35.0
+      westBoundLongitude: -10.0
+    temporalElement:
+      extent:
+        beginPosition: '2020-01-01'
+        endPosition: '2024-12-31'
+  lineage:
+    processStep:
+      dateTime: '2024-01-10T10:00:00'
+      description: Data conversion from source format to GeoPackage.
+      source:
+        description: 'Original data source: [Name and format of original data].'
+    statement: The data in this GeoPackage was created by [Process Description].  The
+      data was converted to GeoPackage format from [Original Format] on [Date].  Metadata
+      was created following the INSPIRE Metadata Implementing Rules.
+  pointOfContact:
+    contactInfo:
+      address:
+        electronicMailAddress: info@example.com
+    organisationName: Example Organisation
+    role:
+      codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_RoleCode
+      codeListValue: originator
+  purpose: To demonstrate the structure of a GeoPackage with INSPIRE-compliant metadata.
+  referenceSystemInfo:
+    referenceSystemIdentifier:
+      code: EPSG:4326
+      codeSpace: EPSG
+  resourceConstraints:
+    accessConstraints:
+      codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_RestrictionCode
+      codeListValue: otherRestrictions
+    otherConstraints: According to the INSPIRE Directive, access to this resource
+      is allowed under the following conditions [describe conditions].
+    useLimitation: No restrictions apply.
+  resourceFormat:
+    name: GeoPackage
+    version: '1.2'
+  resourceLocator:
+  - description: Download the GeoPackage
+    function:
+      codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#CI_OnLineFunctionCode
+      codeListValue: download
+    linkage: http://example.com/geopackage_download.gpkg
+  resourceMaintenance:
+    maintenanceFrequency:
+      codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_MaintenanceFrequencyCode
+      codeListValue: asNeeded
+    maintenanceNote: Metadata is updated as needed.
+  spatialRepresentationType:
+    codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_SpatialRepresentationTypeCode
+    codeListValue: vector
+  spatialResolution:
+    equivalentScale:
+      denominator: 10000
+  status:
+    codeList: http://standards.iso.org/iso/19139/resources/gmxCodelists.xml#MD_ProgressCode
+    codeListValue: completed
+language:
+  codeList: http://www.loc.gov/standards/iso639-2/php/code_list.php
+  codeListValue: eng
+metadataStandardName: ISO 19115
+metadataStandardVersion: ISO 19115:2003/Cor.1:2006
