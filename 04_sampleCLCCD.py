@@ -28,7 +28,7 @@ CLC_FILES = {
     "clc100": {"file": "U2018_CLC2018_V2020_20u1.tif"},
     "clc10": {"file": "CLMS_CLCplus_RASTER_2018_010m_eu_03035_V1_1.tif"},
 }
-DATASETS = ["new", "old", "all"]
+DATASETS = ["all"]
 SAMPLE_LAYER = "convexhulls"
 LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
 

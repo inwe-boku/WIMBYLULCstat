@@ -1,208 +1,174 @@
-import argparse
 import os
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import geopandas as gpd
-from tqdm import tqdm
+import tyro
 
 # ----------------------------------------------------------------------------
-# Configuration Variables (can be overridden via command-line arguments)
+# Configuration Variables
 # ----------------------------------------------------------------------------
 INPUT_DIR = "data/TURBINES"
-SECOND_DATASETS_FOLDER = "data/REGIONS"
+PROCESSED_DIR = "data/00_processedturbines"
+REGIONS_DIR = "data/REGIONS"
 OUTPUT_DIR = "data/01_outregions"
-DATASETS = ["new", "all", "old"]
 TURBINE_LAYER = "turbines"
-MAX_DISTANCE = 5000  # meters for nearest-join in second datasets
-OLD_DISTANCE = 99  # meters proximity to consider turbines as 'old'
-SECOND_DATASETS_CONFIG = {
-    "NUTS.gpkg": ["NUTS1_CODE", "NUTS2_CODE", "NUTS3_CODE", "NUTS3_NAME"],
-    "WWF_Ecos.gpkg": ["WWFEcos_code", "WWFEcos_name", "WWFEcos_realm", "WWFEcos_biome"],
-    "EEA_Biogeoregions2016.gpkg": ["EEABGR_code", "EEABGR_sname", "EEABGR_name"],
-    "EC_ENSv8.gpkg": ["EnS_code", "EnS_name", "EnZ_code", "EnZ_name"],
-}
+SHAPE_DATASETS = ["new", "all"]  # datasets provided as shapefiles
+EXTRA_FILES_DEFAULT = "complete_other.gpkg,complete_offshore.gpkg"
 
 
-def parse_args():
-    """
-    Parse command-line arguments.
+@dataclass
+class Config:
+    """Configuration for turbine processing."""
 
-    Returns:
-        argparse.Namespace: Parsed arguments with attribute 'countries'
-    """
-    parser = argparse.ArgumentParser(
-        description="Process turbine shapefiles by joining with region datasets and extracting 'old' turbines."
+    input_dir: str = INPUT_DIR
+    processed_dir: str = PROCESSED_DIR
+    regions_dir: str = REGIONS_DIR
+    output_dir: str = OUTPUT_DIR
+    extra_files: Optional[str] = EXTRA_FILES_DEFAULT
+    max_distance: int = 25000
+    old_distance: int = 25
+    complete_all_dataset: str = "complete_all.gpkg"
+    complete_all_distance: int = 25
+    complete_all_fields: List[str] = field(
+        default_factory=lambda: ["hubheight", "diameter", "rpower", "model", "cdate"]
     )
-    parser.add_argument(
-        "--countries",
-        type=str,
-        help="Comma-separated list of country folder names to process (overrides auto-detection).",
+    process_countries: bool = True
+    process_extras: bool = False
+    second_datasets_config: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "NUTS.gpkg": ["NUTS1_CODE", "NUTS2_CODE", "NUTS3_CODE", "NUTS3_NAME"],
+            "WWF_Ecos.gpkg": ["WWFEcos_code", "WWFEcos_name", "WWFEcos_realm", "WWFEcos_biome"],
+            "EEA_Biogeoregions2016.gpkg": ["EEABGR_code", "EEABGR_sname", "EEABGR_name"],
+            "EC_ENSv8.gpkg": ["EnS_code", "EnS_name", "EnZ_code", "EnZ_name"],
+        }
     )
-    return parser.parse_args()
 
 
-def get_countries(input_dir, override_list=None):
-    """
-    Determine the list of countries to process.
-
-    Args:
-        input_dir (str): Path to the turbines input directory.
-        override_list (list[str] or None): List of countries provided via CLI.
-
-    Returns:
-        list[str]: Sorted list of country folder names.
-    """
-    if override_list:
-        # Use only the user-specified subset
-        return [c.strip() for c in override_list]
-    # Auto-detect by listing subdirectories in input_dir
+def get_countries(input_dir: str) -> List[str]:
     try:
-        entries = os.listdir(input_dir)
+        return sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
     except FileNotFoundError:
         return []
-    countries = [d for d in entries if os.path.isdir(os.path.join(input_dir, d))]
-    return sorted(countries)
 
 
-def process_single_dataset(country, dataset, second_datasets_folder, output_dir):
-    """
-    Process a single dataset type ('new', 'all', etc.) for a country.
-
-    Args:
-        country (str): Country folder name.
-        dataset (str): Dataset suffix ('new', 'all', 'old').
-        second_datasets_folder (str): Path to region datasets.
-        output_dir (str): Base path to write outputs.
-
-    Returns:
-        bool: True if processing succeeded (shapefile existed), False otherwise.
-    """
-    shp_file = os.path.join(INPUT_DIR, country, f"{country}_{dataset}.shp")
-    if not os.path.exists(shp_file):
-        return False
-
-    try:
-        gdf = gpd.read_file(shp_file)
-    except Exception:
-        return False
-
-    # Deduplicate and index
-    gdf = gdf.drop_duplicates(subset=["geometry"]).reset_index(drop=True)
+def dedupe_index(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    gdf = gdf.drop_duplicates(subset=[gdf.geometry.name]).reset_index(drop=True)
     gdf["fid"] = range(1, len(gdf) + 1)
-    result = gdf
+    return gdf
 
-    # Join with each secondary dataset
-    for fname, fields in SECOND_DATASETS_CONFIG.items():
-        fpath = os.path.join(second_datasets_folder, fname)
-        if not os.path.exists(fpath):
+
+def enrich_with_regions(gdf: gpd.GeoDataFrame, config: Config) -> gpd.GeoDataFrame:
+    result = gdf.copy()
+    for fname, fields in config.second_datasets_config.items():
+        path = os.path.join(config.regions_dir, fname)
+        if not os.path.exists(path):
+            print(f"[WARN] Region file {fname} not found, skipping.")
             continue
-        regions = gpd.read_file(fpath).to_crs(result.crs)
+        regions = gpd.read_file(path).to_crs(result.crs)
         missing = [f for f in fields if f not in regions.columns]
         if missing:
+            print(f"[WARN] Missing fields {missing} in {fname}, skipping.")
             continue
-        regions = regions[["geometry"] + fields]
-
-        # Intersect
-        join = gpd.sjoin(result, regions, how="left", predicate="intersects")
-        join_cols = [c for c in fields if c in join.columns]
-        unmatched = join[join[join_cols].isna().all(axis=1)]
-        if not unmatched.empty:
-            clean = unmatched.drop(columns=join_cols + ["index_right"], errors="ignore")
+        regions = regions[[regions.geometry.name] + fields]
+        joined = gpd.sjoin(result, regions, how="left", predicate="intersects")
+        cols = [c for c in fields if c in joined.columns]
+        mask = joined[cols].isna().all(axis=1)
+        if mask.any():
+            subset = joined.loc[mask].drop(columns=cols + ["index_right"], errors="ignore")
             nearest = gpd.sjoin_nearest(
-                clean,
+                subset,
                 regions,
                 how="left",
-                max_distance=MAX_DISTANCE,
-                distance_col=None,
+                max_distance=config.max_distance,
+                distance_col="nearest_distance",
             )
             nearest = nearest.loc[~nearest.index.duplicated(keep="first")]
-            for col in fields:
-                join.loc[nearest.index, col] = nearest[col]
-
-        # Prepare for next iteration
-        result = join.drop(columns={"index_right", "fid"} & set(join.columns), errors="ignore")
-        result = result[~result.index.duplicated(keep="first")].reset_index(drop=True)
-
-    # Write output
-    country_out = os.path.join(output_dir, country)
-    os.makedirs(country_out, exist_ok=True)
-    out_path = os.path.join(country_out, f"{country}_{dataset}.gpkg")
-    result.to_file(out_path, layer=TURBINE_LAYER)
-    return True
-
-
-def create_old_turbines(country, output_dir):
-    """
-    Generate the 'old' turbine dataset by removing 'all' turbines
-    within OLD_DISTANCE of any 'new' turbine.
-
-    Args:
-        country (str): Country folder name.
-        output_dir (str): Base path where outputs reside.
-    """
-    country_out = os.path.join(output_dir, country)
-    all_fp = os.path.join(country_out, f"{country}_all.gpkg")
-    new_fp = os.path.join(country_out, f"{country}_new.gpkg")
-    old_fp = os.path.join(country_out, f"{country}_old.gpkg")
-
-    if not (os.path.exists(all_fp) and os.path.exists(new_fp)):
-        return
-
-    gdf_all = gpd.read_file(all_fp)
-    gdf_new = gpd.read_file(new_fp)
-    if gdf_all.empty or gdf_new.empty:
-        gdf_old = gdf_all
-    else:
-        joined = gpd.sjoin_nearest(
-            gdf_all,
-            gdf_new[[gdf_new.geometry.name]],
-            how="left",
-            max_distance=OLD_DISTANCE,
+            for col in cols:
+                if col in nearest.columns:
+                    joined.loc[nearest.index, col] = nearest[col]
+        result = (
+            joined.drop(columns={"index_right", "nearest_distance"} & set(joined.columns), errors="ignore")
+            .loc[~joined.index.duplicated(keep="first")]
+            .reset_index(drop=True)
         )
-        to_remove = joined[~joined["index_right"].isna()].index
-        gdf_old = joined.drop(index=to_remove)
-        gdf_old = gdf_old.drop(columns=["index_right"], errors="ignore")
-
-    gdf_old.to_file(old_fp, layer=TURBINE_LAYER)
+    return result
 
 
-def process_turbines(countries, second_datasets_folder, output_dir):
-    """
-    Main processing function: handles all countries and datasets.
-
-    Args:
-        countries (list[str]): List of country folder names.
-        second_datasets_folder (str): Path to region datasets.
-        output_dir (str): Base path to write outputs.
-    """
-    created = {}
-    for country in tqdm(countries, desc="Countries"):
-        successes = []
-        for ds in DATASETS:
-            ok = process_single_dataset(country, ds, second_datasets_folder, output_dir)
-            if ok:
-                successes.append(ds)
-        created[country] = successes
-
-        # Create 'old' only if both 'new' and 'all' succeeded
-        if "new" in successes and "all" in successes:
-            create_old_turbines(country, output_dir)
+def map_complete_all(gdf: gpd.GeoDataFrame, complete_all: gpd.GeoDataFrame, config: Config) -> gpd.GeoDataFrame:
+    fields = [f for f in config.complete_all_fields if f in complete_all.columns]
+    joined = gpd.sjoin_nearest(
+        gdf,
+        complete_all[[complete_all.geometry.name] + fields],
+        how="left",
+        max_distance=config.complete_all_distance,
+        distance_col="_dist_complete_all",
+    )
+    for fld in fields:
+        gdf[fld] = joined.get(fld)
+    return gdf
 
 
-def main():
-    """
-    Entry point: parse arguments, determine countries, and initiate processing.
-    """
-    args = parse_args()
-    override = args.countries.split(",") if args.countries else None
-    countries = get_countries(INPUT_DIR, override)
-
-    if not countries:
-        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+def process_file(in_fp: str, out_fp: str, config: Config, complete_all: Optional[gpd.GeoDataFrame] = None) -> None:
+    if not os.path.exists(in_fp):
+        print(f"[SKIP] {os.path.basename(in_fp)} not found.")
         return
+    print(f"[START] {os.path.basename(in_fp)}")
+    try:
+        gdf = gpd.read_file(in_fp)
+    except Exception as e:
+        print(f"[ERROR] Reading {in_fp}: {e}")
+        return
+    gdf = dedupe_index(gdf)
+    enriched = enrich_with_regions(gdf, config)
+    if complete_all is not None:
+        enriched = map_complete_all(enriched, complete_all, config)
+    os.makedirs(os.path.dirname(out_fp), exist_ok=True)
+    try:
+        enriched.to_file(out_fp, layer=TURBINE_LAYER)
+        print(f"[DONE] Wrote {os.path.basename(out_fp)}")
+    except Exception as e:
+        print(f"[ERROR] Writing {out_fp}: {e}")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    process_turbines(countries, SECOND_DATASETS_FOLDER, OUTPUT_DIR)
+
+def main(config: Config) -> None:
+    # load complete_all dataset
+    ca_fp = os.path.join(config.processed_dir, config.complete_all_dataset)
+    complete_all = None
+    if os.path.exists(ca_fp):
+        complete_all = gpd.read_file(ca_fp)
+    # process per-country shapefiles if enabled
+    if config.process_countries:
+        countries = get_countries(config.input_dir)
+        for country in countries:
+            country_dir = os.path.join(config.output_dir, country)
+            for ds in SHAPE_DATASETS:
+                shp = os.path.join(config.input_dir, country, f"{country}_{ds}.shp")
+                out_fp = os.path.join(country_dir, f"{country}_{ds}.gpkg")
+                process_file(shp, out_fp, config, complete_all)
+            # compute old dataset
+            new_fp = os.path.join(country_dir, f"{country}_new.gpkg")
+            all_fp = os.path.join(country_dir, f"{country}_all.gpkg")
+            if os.path.exists(new_fp) and os.path.exists(all_fp):
+                gdf_new = gpd.read_file(new_fp, layer=TURBINE_LAYER)
+                gdf_all = gpd.read_file(all_fp, layer=TURBINE_LAYER)
+                joined = gpd.sjoin_nearest(
+                    gdf_all, gdf_new, how="left", max_distance=config.old_distance, distance_col="dist"
+                )
+                old = joined[joined["dist"].isna()].drop(columns=["index_right", "dist"], errors="ignore")
+                if complete_all is not None:
+                    old = map_complete_all(old, complete_all, config)
+                out_old = os.path.join(country_dir, f"{country}_old.gpkg")
+                old.to_file(out_old, layer=TURBINE_LAYER)
+    # process extra files if enabled
+    if config.process_extras and config.extra_files:
+        extras_dir = os.path.join(config.output_dir, "0_extras")
+        for fname in [f.strip() for f in config.extra_files.split(",") if f.strip()]:
+            in_fp = os.path.join(config.processed_dir, fname)
+            out_fp = os.path.join(extras_dir, f"processed_{fname}")
+            process_file(in_fp, out_fp, config, complete_all)
+    print("=== Processing complete ===")
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main)

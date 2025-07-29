@@ -2,244 +2,191 @@
 """Process turbine point data to create buffer, convex and concave hulls per cluster.
 
 This script:
-- Reads GeoPackage point datasets per country/dataset.
+- Reads GeoPackage point datasets per country/dataset, excluding the extra folder.
 - Performs DBSCAN clustering to group turbines.
 - Calculates buffer sizes per cluster.
 - Generates buffer polygons, convex hulls, and concave hulls.
-- Writes each layer to output GeoPackages.
+- Processes all files in input_dir/<extra_folder> as extra datasets.
+- Writes outputs under output_dir, with extra outputs in output_dir/<extra_folder>.
 
-Configurable via command-line arguments:
-    --countries: comma-separated list of country folder names to process.
+Configurable via command-line arguments using tyro.
 """
 
-import argparse
-import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Literal, Optional
 
 import geopandas as gpd
 import numpy as np
+import tyro
 from scipy.spatial import distance
 from shapely.geometry import Point
-from shapely.ops import split
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
-# -----------------------------------------------------------------------------
-# Configuration Variables (override via CLI)
-# -----------------------------------------------------------------------------
-INPUT_DIR = "data/01_outregions"
-OUTPUT_DIR = "data/02_outhulls"
-DATASETS = ["new", "all", "old"]
-CRS = "epsg:3035"
-EPSILON = 1500  # DBSCAN eps distance threshold in CRS units
-MIN_SAMPLES = 2  # Minimum samples to form a cluster
-BUFFERPERC = 0.5  # Percentage of nearest neighbor distance for buffer
-BUFFERSCALE1 = 2 / 3
-BUFFERSCALE2 = 1 / 2
-SAMPLE_POINTS = 99  # Number of points to sample on buffer boundary
-CONCAVE_RATIO = 0.25  # Concave hull ratio parameter
+
+@dataclass
+class Config:
+    """Configuration for turbine hull processing."""
+
+    input_dir: Path = Path("data/01_outregions/")
+    """Directory with country subfolders and the extra folder."""
+
+    output_dir: Path = Path("data/02_outhulls/")
+    """Directory for processed hull outputs."""
+
+    extra_folder: str = "0_extras"
+    """Name of the subfolder for extra datasets (case-sensitive)."""
+
+    country: Optional[str] = None
+    """Single country to process; if None, all except extra_folder."""
+
+    datasets: tuple[str, ...] = ("new", "all", "old")
+    """Dataset names within each country folder."""
+
+    crs: str = "epsg:3035"
+    """CRS for processing."""
+
+    epsilon: float = 1500.0
+    """DBSCAN eps parameter."""
+
+    min_samples: int = 2
+    """DBSCAN min_samples parameter."""
+
+    buffer_perc: float = 0.5
+    """Percentage for buffer calculation."""
+
+    buffer_scale1: float = 2.0 / 3.0
+    buffer_scale2: float = 1.0 / 2.0
+    """Buffer scale factors."""
+
+    sample_points: int = 99
+    concave_ratio: float = 0.25
+    """Parameters for concave hull sampling and ratio."""
 
 
-def parse_args():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Create hull layers around clustered turbine points.")
-    parser.add_argument(
-        "--countries",
-        type=str,
-        help="Comma-separated list of country folder names to process (overrides auto-detection).",
-    )
-    return parser.parse_args()
-
-
-def get_countries(input_dir, override_list=None):
-    """Determine list of countries by scanning input_dir or using override."""
-    if override_list:
-        return [c.strip() for c in override_list]
-    try:
-        entries = os.listdir(input_dir)
-    except FileNotFoundError:
+def get_available_countries(input_dir: Path, extra_folder: str) -> List[str]:
+    """List country folders excluding the extra folder."""
+    if not input_dir.exists():
+        print(f"[WARNING] Input directory '{input_dir}' does not exist.")
         return []
-    countries = [d for d in entries if os.path.isdir(os.path.join(input_dir, d))]
-    return sorted(countries)
+    return sorted(p.name for p in input_dir.iterdir() if p.is_dir() and p.name != extra_folder)
 
 
-def clustercalculation(turbines):
-    """Assign DBSCAN clusters and calculate buffer per cluster."""
-    coords = [(geom.x, geom.y) for geom in turbines.geometry]
-    labels = DBSCAN(eps=EPSILON, min_samples=MIN_SAMPLES).fit_predict(coords)
-    turbines["cluster"] = labels
-    cluster_distances = {}
-    for cid in np.unique(labels):
-        if cid == -1:
+def clustercalculation(gdf: gpd.GeoDataFrame, cfg: Config) -> gpd.GeoDataFrame:
+    coords = [(pt.x, pt.y) for pt in gdf.geometry]
+    gdf["cluster"] = DBSCAN(eps=cfg.epsilon, min_samples=cfg.min_samples).fit_predict(coords)
+
+    distances = {}
+    for c in np.unique(gdf["cluster"]):
+        if c == -1:
             continue
-        pts = turbines[turbines.cluster == cid].geometry
-        ccoords = np.array([(pt.x, pt.y) for pt in pts])
-        dmat = distance.cdist(ccoords, ccoords)
+        pts = gdf.loc[gdf["cluster"] == c, "geometry"]
+        arr = np.array([(p.x, p.y) for p in pts])
+        dmat = distance.cdist(arr, arr)
         dmat[dmat < 9] = np.inf
         mins = np.min(dmat, axis=1)
-        valids = mins[np.isfinite(mins)]
-        buf = int(round(valids.mean() * BUFFERPERC, 0)) if len(valids) > 0 else np.nan
-        cluster_distances[cid] = buf
-    turbines["buffer"] = turbines.cluster.map(cluster_distances)
-    default = int(round(turbines.buffer.dropna().mean(), 0)) if not turbines.buffer.dropna().empty else 0
-    turbines["buffer"] = turbines.buffer.fillna(default)
-    return turbines
+        vals = mins[np.isfinite(mins)]
+        distances[c] = int(round(np.mean(vals * cfg.buffer_perc), 0)) if len(vals) else np.nan
+    gdf["buffer"] = gdf["cluster"].map(distances)
+    default = int(round(gdf["buffer"].dropna().mean(), 0)) if not gdf["buffer"].dropna().empty else 0
+    gdf["buffer"] = gdf["buffer"].fillna(default)
+    return gdf
 
 
-def create_buffer_polygons(points):
-    """Generate buffer polygons around points using combined buffer scales."""
-    df = points.copy()
-    df["geometry"] = points.buffer(points.buffer.values * (BUFFERSCALE1 + BUFFERSCALE2))
-    return df
-
-
-def create_convex_hulls(points):
-    """Generate convex hulls per cluster and buffer them."""
-    grouped = points.dissolve(by="cluster")
-    hulls = grouped.convex_hull.buffer(grouped.buffer.values * (BUFFERSCALE1 + BUFFERSCALE2))
-    df = grouped.copy()
-    df["geometry"] = hulls
-    return df
-
-
-def sample_buffer_boundaries(points, scale, n_points):
-    """Sample n_points along the buffer boundary of each point."""
+def sample_buffer_boundaries(gdf: gpd.GeoDataFrame, scale: float, n: int) -> gpd.GeoDataFrame:
     records = []
-    for _, row in points.iterrows():
-        buf_geom = row.geometry.buffer(row.buffer * scale)
-        boundary = buf_geom.boundary
-        coords = list(boundary.coords)
-        step = max(1, len(coords) // n_points)
+    for _, row in gdf.iterrows():
+        buf = row.geometry.buffer(row["buffer"] * scale)
+        coords = list(buf.boundary.coords)
+        step = max(1, len(coords) // n)
         for pt in coords[::step]:
             rec = row.to_dict()
             rec["geometry"] = Point(pt)
             records.append(rec)
-    return gpd.GeoDataFrame(records, crs=points.crs)
+    return gpd.GeoDataFrame(records, crs=gdf.crs)
 
 
-def create_concave_hulls(points):
-    """Generate concave hulls via boundary sampling and concave_hull op."""
-    bp = sample_buffer_boundaries(points, BUFFERSCALE1, SAMPLE_POINTS)
-    grouped = bp.dissolve(by="cluster")
-    hulls = grouped.concave_hull(ratio=CONCAVE_RATIO).buffer(grouped.buffer.values * BUFFERSCALE2)
-    df = grouped.copy()
-    df["geometry"] = hulls
-    return df
-
-
-def create_hulls(points, hull_type="convex"):
-    """Wrapper to generate buffer, convex, or concave hulls."""
+def create_hulls(
+    gdf: gpd.GeoDataFrame, hull_type: Literal["buffer", "convex", "concave"], cfg: Config
+) -> gpd.GeoDataFrame:
     if hull_type == "buffer":
-        hulls = create_buffer_polygons(points)
+        out = gdf.copy(deep=False)
+        out["geometry"] = gdf.buffer(gdf["buffer"] * (cfg.buffer_scale1 + cfg.buffer_scale2))
     elif hull_type == "convex":
-        hulls = create_convex_hulls(points)
-    elif hull_type == "concave":
-        hulls = create_concave_hulls(points)
+        grp = gdf.dissolve(by="cluster")
+        hull = grp.convex_hull.buffer(grp["buffer"] * (cfg.buffer_scale1 + cfg.buffer_scale2))
+        out = grp.copy(deep=False)
+        out["geometry"] = hull
     else:
-        raise ValueError("Choose 'buffer', 'convex', or 'concave'")
-    hulls.reset_index(inplace=True)
-    hulls["hull_id"] = hulls.index + 1
-    return hulls
+        bp = sample_buffer_boundaries(gdf, cfg.buffer_scale1, cfg.sample_points)
+        grp = bp.dissolve(by="cluster")
+        hull = grp.concave_hull(ratio=cfg.concave_ratio).buffer(grp["buffer"] * cfg.buffer_scale2)
+        out = grp.copy(deep=False)
+        out["geometry"] = hull
+    out = out.reset_index(drop=True)
+    out["hull_id"] = out.index + 1
+    return out
 
 
-def split_hulls(hulls, split_polygons):
-    """Split hulls by polygon boundaries and remove duplicates."""
-    split_lines = split_polygons.boundary
-    results = []
-    for _, hull in hulls.iterrows():
-        geoms = [hull.geometry]
-        for line in split_lines:
-            next_geoms = []
-            for g in geoms:
-                if g.intersects(line):
-                    parts = split(g, line)
-                    next_geoms.extend([p for p in parts.geoms if p.is_valid and not p.is_empty])
-                else:
-                    next_geoms.append(g)
-            geoms = next_geoms
-        for g in geoms:
-            rec = hull.to_dict()
-            rec["geometry"] = g
-            results.append(rec)
-    return gpd.GeoDataFrame(results, crs=hulls.crs).drop_duplicates(subset="geometry")
-
-
-def assign_tile_best(turbines, polygons):
-    """Assign most common turbine.tile_best to each polygon."""
-    if "tile_best" not in turbines.columns:
-        polygons["tile_best"] = None
-        return polygons
-    turbines = turbines.to_crs(polygons.crs)
-    polygons["tile_best"] = None
-    for idx, poly in polygons.iterrows():
-        pts = turbines[turbines.geometry.within(poly.geometry)]
-        if not pts.empty:
-            mode = pts["tile_best"].mode()
-            if not mode.empty:
-                polygons.at[idx, "tile_best"] = mode[0]
-    return polygons
-
-
-def merge_slivers(hulls, slivers):
-    """Merge sliver polygons (<1% area) with adjacent ones."""
-    if "hull_id" not in hulls.columns or "hull_id" not in slivers.columns:
-        raise ValueError("Missing 'hull_id'")
-    hulls["original_area"] = hulls.geometry.area
-    sl = slivers.copy()
-    sl["split_area"] = sl.geometry.area
-    sl = sl.merge(hulls[["hull_id", "original_area"]], on="hull_id", how="left")
-    sl["area_percentage"] = sl.split_area / sl.original_area * 100
-    updated = []
-    processed = set()
-    for idx, s in sl.iterrows():
-        if idx in processed:
-            continue
-        if s.area_percentage < 1:
-            adj = sl[sl.geometry.touches(s.geometry) & ~sl.index.isin(processed)]
-            if not adj.empty:
-                first = adj.iloc[0]
-                merged_geom = s.geometry.union(first.geometry)
-                rec = s.to_dict()
-                rec["geometry"] = merged_geom
-                updated.append(rec)
-                processed.update({idx, first.name})
-            else:
-                updated.append(s.to_dict())
-                processed.add(idx)
-        else:
-            updated.append(s.to_dict())
-            processed.add(idx)
-    df = gpd.GeoDataFrame(updated, crs=sl.crs).drop_duplicates(subset="geometry")
-    df["split_area"] = df.geometry.area
-    df["area_percentage"] = df.split_area / df.original_area * 100
-    return df
-
-
-def main():
-    """Entry point: parse args, detect countries, process each hull type."""
-    args = parse_args()
-    override = args.countries.split(",") if args.countries else None
-    countries = get_countries(INPUT_DIR, override)
-    if not countries:
-        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+def process_extra_files(cfg: Config) -> None:
+    extras = cfg.input_dir / cfg.extra_folder
+    if not extras.exists():
+        print(f"[WARNING] No extras folder at {extras}")
         return
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    fps = [p for p in extras.iterdir() if p.suffix.lower() == ".gpkg"]
+    if not fps:
+        print(f"[INFO] No GPKG files in {extras}")
+        return
+    out_ex = cfg.output_dir / cfg.extra_folder
+    out_ex.mkdir(parents=True, exist_ok=True)
+    print(f"=== Processing extras in {extras} ===")
+    for fp in fps:
+        print(f"-- {fp.name}")
+        gdf = gpd.read_file(fp)
+        if gdf.empty:
+            print("[INFO] empty, skip")
+            continue
+        gdf = gdf.to_crs(cfg.crs).drop_duplicates(subset=["geometry"])
+        tur = clustercalculation(gdf, cfg)
+        stem = fp.stem
+        outfp = out_ex / f"{stem}.gpkg"
+        tur.to_file(outfp, layer="turbines")
+        create_hulls(tur, "buffer", cfg).to_file(outfp, layer="bufferpolys")
+        create_hulls(tur[tur["cluster"] != -1], "concave", cfg).to_file(outfp, layer="concavehulls")
+        create_hulls(tur[tur["cluster"] != -1], "convex", cfg).to_file(outfp, layer="convexhulls")
+        print("[DONE]", outfp)
+
+
+def main(cfg: Config) -> None:
+    if cfg.country:
+        countries = [cfg.country]
+    else:
+        countries = get_available_countries(cfg.input_dir, cfg.extra_folder)
+    if not countries:
+        print("[ERROR] No countries found, exiting.")
+        return
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     for country in tqdm(countries, desc="Countries"):
-        country_out = os.path.join(OUTPUT_DIR, country)
-        os.makedirs(country_out, exist_ok=True)
-        for ds in DATASETS:
-            fp = os.path.join(INPUT_DIR, country, f"{country}_{ds}.gpkg")
-            if not os.path.exists(fp):
+        od = cfg.output_dir / country
+        od.mkdir(exist_ok=True)
+        for ds in cfg.datasets:
+            fp = cfg.input_dir / country / f"{country}_{ds}.gpkg"
+            if not fp.exists():
+                print(f"[WARN] {fp} missing")
                 continue
             gdf = gpd.read_file(fp)
             if gdf.empty:
                 continue
-            gdf = gdf.to_crs(CRS).drop_duplicates(subset="geometry")
-            gdf = clustercalculation(gdf)
-            gdf.to_file(os.path.join(country_out, f"{country}_{ds}.gpkg"), layer="turbines")
-            for htype, layer in [("buffer", "bufferpolys"), ("convex", "convexhulls"), ("concave", "concavehulls")]:
-                hulls = create_hulls(gdf, htype)
-                hulls.to_file(os.path.join(country_out, f"{country}_{ds}.gpkg"), layer=layer)
+            gdf = gdf.to_crs(cfg.crs).drop_duplicates(subset=["geometry"])
+            tur = clustercalculation(gdf, cfg)
+            tur.to_file(od / fp.name, layer="turbines")
+            create_hulls(tur, "buffer", cfg).to_file(od / fp.name, layer="bufferpolys")
+            create_hulls(tur[tur["cluster"] != -1], "concave", cfg).to_file(od / fp.name, layer="concavehulls")
+            create_hulls(tur[tur["cluster"] != -1], "convex", cfg).to_file(od / fp.name, layer="convexhulls")
+    process_extra_files(cfg)
 
 
 if __name__ == "__main__":
-    main()
+    cfg = tyro.cli(Config)
+    main(cfg)
