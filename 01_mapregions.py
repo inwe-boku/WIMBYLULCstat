@@ -121,6 +121,7 @@ def process_file(in_fp: str, out_fp: str, config: Config, complete_all: Optional
         return
     gdf = dedupe_index(gdf)
     enriched = enrich_with_regions(gdf, config)
+    # Only map complete_all if DataFrame is provided
     if complete_all is not None:
         enriched = map_complete_all(enriched, complete_all, config)
     os.makedirs(os.path.dirname(out_fp), exist_ok=True)
@@ -137,6 +138,7 @@ def main(config: Config) -> None:
     complete_all = None
     if os.path.exists(ca_fp):
         complete_all = gpd.read_file(ca_fp)
+
     # process per-country shapefiles if enabled
     if config.process_countries:
         countries = get_countries(config.input_dir)
@@ -146,6 +148,7 @@ def main(config: Config) -> None:
                 shp = os.path.join(config.input_dir, country, f"{country}_{ds}.shp")
                 out_fp = os.path.join(country_dir, f"{country}_{ds}.gpkg")
                 process_file(shp, out_fp, config, complete_all)
+
             # compute old dataset
             new_fp = os.path.join(country_dir, f"{country}_new.gpkg")
             all_fp = os.path.join(country_dir, f"{country}_all.gpkg")
@@ -160,13 +163,17 @@ def main(config: Config) -> None:
                     old = map_complete_all(old, complete_all, config)
                 out_old = os.path.join(country_dir, f"{country}_old.gpkg")
                 old.to_file(out_old, layer=TURBINE_LAYER)
-    # process extra files if enabled
+
+    # process extra files if enabled: only map regions, skip complete_all
     if config.process_extras and config.extra_files:
         extras_dir = os.path.join(config.output_dir, "0_extras")
+        os.makedirs(extras_dir, exist_ok=True)
         for fname in [f.strip() for f in config.extra_files.split(",") if f.strip()]:
             in_fp = os.path.join(config.processed_dir, fname)
             out_fp = os.path.join(extras_dir, f"processed_{fname}")
-            process_file(in_fp, out_fp, config, complete_all)
+            # pass None for complete_all to skip mapping complete_all
+            process_file(in_fp, out_fp, config, complete_all=None)
+
     print("=== Processing complete ===")
 
 

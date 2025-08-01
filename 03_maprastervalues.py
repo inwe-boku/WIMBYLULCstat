@@ -3,36 +3,32 @@
 Advanced Raster Sampling for Wind Turbine Geospatial Analysis
 
 This script processes hull and turbine layers to sample raster attributes per country and dataset,
-as well as any additional GeoPackages placed in a configurable extras folder.
+with optional processing of additional GeoPackages in a configurable extras folder.
 
 Key Features:
-- Multi-country processing with automatic detection or manual selection, excluding the extras folder.
+- Multi-country processing with automatic detection or manual selection, excluding the extras folder by default.
 - Multiple raster field sampling (altitude, slope, TRI) with precision control.
-- Point geometry: Direct pixel value lookup using rasterio's sample() for speed.
-- Polygon geometry: Mean over pixels using rasterstats.zonal_stats for vectorized performance.
-- Processing of all .gpkg files in input_dir/<extra_folder> with same sampling logic.
-- CRS reprojection, windowed raster reading, progress bars, robust error handling.
+- Point geometry: Direct pixel lookup via rasterio.sample for speed.
+- Polygon geometry: Mean over pixels via rasterstats.zonal_stats for vectorized performance.
+- Optional processing of all .gpkg files in input_dir/<extra_folder> when --process-extras is set.
+- CRS reprojection, progress bars, robust error handling.
 
 Usage Examples:
     python process_rasters.py
-    python process_rasters.py --countries austria --extra-folder 0_extras
+    python process_rasters.py --countries austria --process-extras
+    python process_rasters.py --extra-folder 0_extras --process-extras
 
 Directory Structure Expected:
 data/
-├── 02_outhulls/          # Input GPKG by country
-│   ├── austria/
-│   │   ├── austria_new.gpkg
-│   │   └── ...
-│   └── poland/
-│       └── ...
-├── 03_outraster/         # Output directory (created automatically)
-└── RASTER/               # Raster files
+├── 02_outhulls/       # Input GPKG by country
+├── 03_outraster/      # Output directory (created automatically)
+└── RASTER/            # Raster files
     ├── Copernicus_DSM_90m_COG_3035.tif
     └── ...
 
 Extras:
-Place any standalone .gpkg files to process in input_dir/<extra_folder> (default: "0_extras").
-Outputs will be in output_dir/<extra_folder>.
+Place standalone .gpkg files in input_dir/<extra_folder> (default: "0_extras").
+Use --process-extras to include them in sampling; outputs go to output_dir/<extra_folder>.
 """
 
 from dataclasses import dataclass
@@ -65,6 +61,8 @@ class Args:
     verbose: bool = False
     dry_run: bool = False
     extra_folder: Optional[str] = None
+    process_extras: bool = False
+    """When set, process .gpkg files in the extras folder."""
 
 
 def get_raster_config():
@@ -208,40 +206,41 @@ def process_raster_files(config: Config, args: Args):
                     if args.debug:
                         print(f"Wrote {lyr} to {out_fp}")
 
-    # process extras
-    extras_dir = config.input_dir / (args.extra_folder or config.extra_folder)
-    if extras_dir.exists():
-        out_ex = config.output_dir / (args.extra_folder or config.extra_folder)
-        if not args.dry_run:
-            out_ex.mkdir(parents=True, exist_ok=True)
-        fps = [p for p in extras_dir.iterdir() if p.suffix.lower() == ".gpkg"]
-        for fp in tqdm(fps, desc="Extras"):
-            layers = {}
-            for lyr in ["turbines", "bufferpolys", "concavehulls", "convexhulls"]:
-                try:
-                    layers[lyr] = gpd.read_file(fp, layer=lyr)
-                except:
-                    layers[lyr] = gpd.GeoDataFrame()
-            bbs = [g.total_bounds for g in layers.values() if not g.empty]
-            if not bbs:
-                continue
-            bbox = [
-                min(bb[0] for bb in bbs),
-                min(bb[1] for bb in bbs),
-                max(bb[2] for bb in bbs),
-                max(bb[3] for bb in bbs),
-            ]
-            for name, spec in specs.items():
-                raster_path = config.raster_dir / spec.file
-                if not raster_path.exists():
-                    continue
-                with rasterio.open(raster_path) as rast:
-                    sampled = sample_layers(layers, rast, raster_path, spec, args)
-                    layers = sampled
+    # process extras if requested
+    if args.process_extras:
+        extras_dir = config.input_dir / (args.extra_folder or config.extra_folder)
+        if extras_dir.exists():
+            out_ex = config.output_dir / (args.extra_folder or config.extra_folder)
             if not args.dry_run:
-                for lyr, gdf in layers.items():
-                    out_fp = out_ex / f"{fp.stem}.gpkg"
-                    gdf.to_file(out_fp, layer=lyr, driver="GPKG")
+                out_ex.mkdir(parents=True, exist_ok=True)
+            fps = [p for p in extras_dir.iterdir() if p.suffix.lower() == ".gpkg"]
+            for fp in tqdm(fps, desc="Extras"):
+                layers = {}
+                for lyr in ["turbines", "bufferpolys", "concavehulls", "convexhulls"]:
+                    try:
+                        layers[lyr] = gpd.read_file(fp, layer=lyr)
+                    except:
+                        layers[lyr] = gpd.GeoDataFrame()
+                bbs = [g.total_bounds for g in layers.values() if not g.empty]
+                if not bbs:
+                    continue
+                bbox = [
+                    min(bb[0] for bb in bbs),
+                    min(bb[1] for bb in bbs),
+                    max(bb[2] for bb in bbs),
+                    max(bb[3] for bb in bbs),
+                ]
+                for name, spec in specs.items():
+                    raster_path = config.raster_dir / spec.file
+                    if not raster_path.exists():
+                        continue
+                    with rasterio.open(raster_path) as rast:
+                        sampled = sample_layers(layers, rast, raster_path, spec, args)
+                        layers = sampled
+                if not args.dry_run:
+                    for lyr, gdf in layers.items():
+                        out_fp = out_ex / f"{fp.stem}.gpkg"
+                        gdf.to_file(out_fp, layer=lyr, driver="GPKG")
 
 
 def main():
@@ -249,7 +248,7 @@ def main():
     display_welcome_message()
     print("🎯 PROCESSING SUMMARY:")
     extras = args.extra_folder or Config().extra_folder
-    print(f"  Extras folder: {extras}")
+    print(f"  Extras folder: {extras} (process_extras={args.process_extras})")
     process_raster_files(Config(), args)
 
 

@@ -1,222 +1,276 @@
 #!/usr/bin/env python3
 """
-process_turbines.py
+Aggregate CLC-based statistics for turbine hull layers across countries and datasets.
 
-Process and merge DTU, OSM and 'OWN' wind‑turbine shapefiles into GeoPackages.
+This script:
+- Reads processed GeoPackages containing CLC-enriched polygon layers (with integrated turbine attributes).
+- Loads CLC lookup tables from an Excel file.
+- Computes CLC class statistics per polygon layer.
+- Exports both GeoPackage layers and per-country Excel reports with detailed and summary sheets.
 
 Usage:
-    python process_turbines.py [OPTIONS]
-
-This script performs the following steps:
-    1. Read DTU and OSM turbine shapefiles
-    2. Reproject to EPSG:3035 and remove duplicates
-    3. Rename and filter DTU/OSM attributes
-    4. Merge DTU & OSM references into a single GeoDataFrame
-    5. Process country-specific "new" and "all" shapefiles:
-       - Concatenate, reproject
-       - Spatial join nearest from ref_merge to attach standardized fields
-       - Remove duplicates
-    6. Write complete_new.gpkg and complete_all.gpkg
-    7. Identify "old" turbines = complete_all − complete_new
-       - Copy ref_merge fields via nearest join
-       - Remove duplicates → complete_old.gpkg
-    8. Offshore & other-country datasets from ref_merge:
-       - Offshore: ref_merge points intersecting OCEAN → complete_offshore.gpkg
-       - Other: ref_merge points within NUTS3-buffer minus known countries → complete_other.gpkg
-    9. Generate summary CSV of feature counts
+    python process_clc_stats_refactored.py [--countries austria,france]
 """
 
+import argparse
 import os
-from dataclasses import dataclass
-from glob import glob
+import re
+from typing import Dict, List, Optional
 
 import geopandas as gpd
 import pandas as pd
-import tyro
+from tqdm import tqdm
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+PROJECT_CRS = "EPSG:3035"
+INPUT_DIR = "data/04_clc"
+OUTPUT_DIR = "data/05_stat"
+CLC_LOOKUP = "data/CLC/CLC.xlsx"
+DATASETS = ["new", "old", "all"]
+POLY_LAYERS = ["bufferpolys", "concavehulls", "convexhulls"]
+CLC_TYPES = ["clc100", "clc10"]
+
+# store skipped datasets for summary
+skipped_datasets: List[str] = []
 
 
-def verbose(msg: str):
-    print(f"[INFO] {msg}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compute CLC statistics for turbine hulls per country and dataset.")
+    parser.add_argument(
+        "--countries",
+        type=str,
+        help="Comma-separated list of country folder names to process.",
+    )
+    return parser.parse_args()
 
 
-@dataclass
-class Config:
-    output_dir: str = "data/00_processedturbines"
-    turbines_dir: str = "data/TURBINES"
-    dtu_osm_dir: str = "data/DTU_OSM"
-    crs_input_default: int = 4326
-    crs_target: int = 3035
-    join_distance: float = 1500.0
-    old_distance_threshold: float = 250.0
-    dataset_types: list[str] = None
-
-    def __post_init__(self):
-        if self.dataset_types is None:
-            self.dataset_types = ["new", "all"]
+def get_countries(base_dir: str, override: Optional[List[str]] = None) -> List[str]:
+    if override:
+        return [c.strip() for c in override]
+    try:
+        entries = os.listdir(base_dir)
+    except FileNotFoundError:
+        return []
+    return sorted([d for d in entries if os.path.isdir(os.path.join(base_dir, d))])
 
 
-# Rename maps
-RENAME_MAP_DTU = {
-    "Hub_height": "DTU_hubheight",
-    "P_rated_kW": "DTU_rpower",
-    "Diameter_m": "DTU_diameter",
-    "Commission": "DTU_cdate",
-}
-RENAME_MAP_OSM = {
-    "hubheight": "OSM_hubheight",
-    "generator": "OSM_model",
-    "ratedKW": "OSM_rpower",
-    "rotordia": "OSM_diameter",
-}
+def load_clc_lookup(path: str) -> Dict[str, pd.DataFrame]:
+    lookup: Dict[str, pd.DataFrame] = {}
+    for clc in CLC_TYPES:
+        try:
+            df = pd.read_excel(path, sheet_name=clc)
+            if "Category" in df.columns and "CatName" in df.columns:
+                df["CatName"] = df.groupby("Category")["CatName"].ffill()
+            lookup[clc] = df
+        except Exception:
+            lookup[clc] = pd.DataFrame()
+    return lookup
 
 
-def remove_duplicate_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    if gdf.empty:
-        return gdf
-    temp = gdf.copy()
-    temp["_wkt"] = temp.geometry.apply(lambda g: g.wkt if g is not None else None)
-    ded = temp.drop_duplicates(subset=["_wkt"]).drop(columns=["_wkt"])
-    return ded.reset_index(drop=True)
+def compute_stats_for_layer(poly_gdf: gpd.GeoDataFrame, clc_type: str, lookup_df: pd.DataFrame) -> pd.DataFrame:
+    val_pattern = re.compile(rf"^{clc_type}_VAL_(\d+)$")
+    cd_pattern = re.compile(rf"^{clc_type}_CD_(\d+)$")
+    val_cols = [c for c in poly_gdf.columns if val_pattern.match(c)]
+    cd_cols = [c for c in poly_gdf.columns if cd_pattern.match(c)]
+    total_val = poly_gdf[val_cols].sum() if val_cols else pd.Series(dtype=int)
+    total_cd = poly_gdf[cd_cols].sum() if cd_cols else pd.Series(dtype=int)
+    total_val_sum = int(total_val.sum())
+    total_cd_sum = int(total_cd.sum())
+    rows = []
+    for col in sorted(total_val.index):
+        val = int(val_pattern.match(col).group(1))
+        area = int(total_val[col])
+        carea = int(total_cd.get(col.replace("VAL", "CD"), 0))
+        careap = round(carea / area * 100, 2) if area > 0 else 0
+        ashare = round(area / total_val_sum * 100, 2) if total_val_sum > 0 else 0
+        rows.append({"Value": val, "area": area, "carea": carea, "careap": careap, "ashare": ashare})
+    stats_df = pd.DataFrame(rows).set_index("Value")
+    if "Value" in lookup_df.columns:
+        vals = lookup_df["Value"].dropna().astype(int).unique()
+        stats_df = stats_df.reindex(vals, fill_value=0)
+    stats_df[f"{clc_type}_VAL_sum"] = total_val_sum
+    stats_df[f"{clc_type}_CD_sum"] = total_cd_sum
+    return stats_df
 
 
-def process_DTUturbines(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    df = gdf.rename(columns=RENAME_MAP_DTU)
-    cols = list(RENAME_MAP_DTU.values()) + [df.geometry.name]
-    return df[[c for c in cols if c in df.columns]]
+def process_gpkg(
+    country: str,
+    ds: str,
+    gdf_turb: gpd.GeoDataFrame,
+    polys: Dict[str, gpd.GeoDataFrame],
+    output_dir: str = OUTPUT_DIR,
+) -> None:
+    out_gpkg_dir = os.path.join(output_dir, "gpkg")
+    os.makedirs(out_gpkg_dir, exist_ok=True)
+    out_gpkg = os.path.join(out_gpkg_dir, f"{country}_{ds}.gpkg")
+    if os.path.exists(out_gpkg):
+        os.remove(out_gpkg)
+    gdf_turb.to_file(out_gpkg, layer="turbines", driver="GPKG")
+    for ly, gdf in polys.items():
+        gdf.to_file(out_gpkg, layer=ly, driver="GPKG", mode="a")
 
 
-def process_OSMturbines(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    df = gdf.rename(columns=RENAME_MAP_OSM)
-    cols = list(RENAME_MAP_OSM.values()) + [df.geometry.name]
-    return df[[c for c in cols if c in df.columns]]
+def process_xls(
+    country: str,
+    ds: str,
+    polys: Dict[str, gpd.GeoDataFrame],
+    lookup: Dict[str, pd.DataFrame],
+    gdf_turb: gpd.GeoDataFrame,
+    output_dir: str = OUTPUT_DIR,
+) -> None:
+    out_xls_dir = os.path.join(output_dir, "xls")
+    os.makedirs(out_xls_dir, exist_ok=True)
+    xls_path = os.path.join(out_xls_dir, f"{country}_{ds}.xlsx")
+    import numpy as np
+
+    with pd.ExcelWriter(xls_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        header_format = workbook.add_format({"text_wrap": True, "align": "center"})
+        # Detailed CLC sheets
+        for clc in CLC_TYPES:
+            lookup_df = lookup.get(clc, pd.DataFrame())
+            if lookup_df.empty:
+                continue
+            meta_cols = [c for c in lookup_df.columns if c != "Value"]
+            meta = lookup_df.set_index("Value")[meta_cols]
+            parts = []
+            for ly in POLY_LAYERS:
+                stats = compute_stats_for_layer(polys[ly], clc, lookup_df)
+                core = stats[["area", "carea", "careap", "ashare"]].copy()
+                core.columns = pd.MultiIndex.from_product([[ly], core.columns])
+                parts.append(core)
+            df_detail = pd.concat(parts, axis=1)
+            meta.columns = pd.MultiIndex.from_product([[""], meta.columns])
+            df_out = pd.concat([meta, df_detail], axis=1)
+            df_out.to_excel(writer, sheet_name=clc, startrow=0)
+            ws_clc = writer.sheets[clc]
+            ws_clc.set_row(0, 30, header_format)
+            ws_clc.set_row(1, 20, header_format)
+            col_offset = len(meta_cols) + 1
+            for i, ly in enumerate(POLY_LAYERS):
+                start = col_offset + i * 4
+                end = start + 3
+                try:
+                    ws_clc.merge_range(0, start, 0, end, ly, header_format)
+                except Exception:
+                    pass
+            for idx, col in enumerate(df_out.columns):
+                col_idx = idx + 1
+                header = " ".join([str(x) for x in col if x])
+                max_len = len(header)
+                col_vals = df_out[col].astype(str)
+                if not col_vals.empty:
+                    max_len = max(max_len, col_vals.map(len).max())
+                ws_clc.set_column(col_idx, col_idx, max_len + 2)
+        # Summary sheet
+        from collections import OrderedDict
+
+        metrics = OrderedDict([
+            ("total_turbines", "total turbines"),
+            ("num_windparks", "number of windparks"),
+            ("avg_turbines_per_concavehulls", "average turbines per windpark"),
+            ("avg_hubheight", "average hubheight"),
+            ("avg_diameter", "average diameter"),
+            ("avg_rpower", "average rpower"),
+        ])
+        # compute basic metrics
+        num_turbines = len(gdf_turb)
+        num_polys = len(polys["concavehulls"])
+        metric_vals = [
+            num_turbines,
+            num_polys,
+            num_turbines / num_polys if num_polys else 0,
+            float(gdf_turb["hubheight"].mean()),
+            float(gdf_turb["diameter"].mean()),
+            float(gdf_turb["rpower"].mean()),
+        ]
+        # compute sums for each CLC type and polygon layer: area and changed area
+        clc_vals = []
+        for clc in CLC_TYPES:
+            for ly in POLY_LAYERS:
+                area_sum = int(polys[ly][f"{clc}_VAL_sum"].sum())
+                changed_sum = int(polys[ly][f"{clc}_CD_sum"].sum())
+                clc_vals.extend([area_sum, changed_sum])
+        # build multi-index: first metrics, then per-CLC in order bufferpolys area, bufferpolys carea, concavehulls area, concavehulls carea, convexhulls area, convexhulls carea
+        top = ["Metrics"] * len(metrics) + [clc for clc in CLC_TYPES for _ in range(len(POLY_LAYERS) * 2)]
+        bottom = list(metrics.values())
+        for clc in CLC_TYPES:
+            for ly in POLY_LAYERS:
+                bottom.append(f"{ly} area")
+                bottom.append(f"{ly} changed_area")
+        mindex = pd.MultiIndex.from_arrays([top, bottom])
+        df_sum = pd.DataFrame([metric_vals + clc_vals], columns=mindex)
+        df_sum = df_sum.replace([np.nan, np.inf, -np.inf], 0).round(0).astype(int)
+        df_sum.to_excel(writer, sheet_name="summary", startrow=0)
+        ws_sum = writer.sheets["summary"]
+        ws_sum.set_column(0, 0, None, None, {"hidden": True})
+        ws_sum.set_row(0, 30, header_format)
+        ws_sum.set_row(1, 30, header_format)
+        for idx, col in enumerate(df_sum.columns):
+            col_idx = idx + 1
+            header = " ".join([str(x) for x in col if x])
+            max_len = len(header)
+            col_vals = df_sum[col].astype(str)
+            if not col_vals.empty:
+                max_len = max(max_len, col_vals.map(len).max())
+            ws_sum.set_column(col_idx, col_idx, max_len + 2)
 
 
-def process_turbines(config: Config):
-    os.makedirs(config.output_dir, exist_ok=True)
-    stats = []
+def process_country(
+    country: str,
+    args: argparse.Namespace,
+    lookup: Dict[str, pd.DataFrame],
+) -> None:
+    in_dir = os.path.join(INPUT_DIR, country)
+    from tqdm import tqdm as _tqdm
 
-    # 1-2) Load & process DTU/OSM
-    dtu = gpd.read_file(os.path.join(config.dtu_osm_dir, "DTUturbines.shp")).to_crs(epsg=config.crs_target)
-    dtu = process_DTUturbines(dtu)
-    dtu = remove_duplicate_geometries(dtu)
-    osm = gpd.read_file(os.path.join(config.dtu_osm_dir, "OSMturbines.shp")).to_crs(epsg=config.crs_target)
-    osm = process_OSMturbines(osm)
-    osm = remove_duplicate_geometries(osm)
+    ds_bar = _tqdm(DATASETS, desc=country, leave=False)
+    for ds in ds_bar:
+        ds_bar.set_description(f"{country}-{ds}")
+        src = os.path.join(in_dir, f"{country}_{ds}.gpkg")
+        if not os.path.exists(src):
+            skipped_datasets.append(f"{country}-{ds}")
+            continue
+        try:
+            gdf_turb = gpd.read_file(src, layer="turbines").to_crs(PROJECT_CRS)
+            polys = {ly: gpd.read_file(src, layer=ly).to_crs(PROJECT_CRS) for ly in POLY_LAYERS}
 
-    # Stats for raw refs
-    stats.append({
-        "dataset": "DTU",
-        "count_before_dedup": len(dtu),
-        "count_after_dedup": len(dtu),
-        "rpower_count": dtu["DTU_rpower"].notna().sum(),
-    })
-    stats.append({
-        "dataset": "OSM",
-        "count_before_dedup": len(osm),
-        "count_after_dedup": len(osm),
-        "rpower_count": osm["OSM_rpower"].notna().sum(),
-    })
+            # Compute class sums
+            for ly in POLY_LAYERS:
+                g = polys[ly]
+                for clc in CLC_TYPES:
+                    cd_cols = [c for c in g.columns if c.startswith(f"{clc}_CD_")]
+                    val_cols = [c for c in g.columns if c.startswith(f"{clc}_VAL_")]
+                    g[f"{clc}_CD_sum"] = g[cd_cols].sum(axis=1).astype(int) if cd_cols else 0
+                    g[f"{clc}_VAL_sum"] = g[val_cols].sum(axis=1).astype(int) if val_cols else 0
+                    for c in cd_cols + val_cols + [f"{clc}_CD_sum", f"{clc}_VAL_sum"]:
+                        g[c] *= 100
+                    polys[ly] = g
 
-    # 3) Merge references
-    ref_merge = pd.concat([dtu, osm], ignore_index=True)
-    ref_merge = gpd.GeoDataFrame(ref_merge, crs=dtu.crs)
-    ref_merge = remove_duplicate_geometries(ref_merge)
-    stats.append({
-        "dataset": "DTU_OSM_merge",
-        "count_before_dedup": len(ref_merge),
-        "count_after_dedup": len(ref_merge),
-        "rpower_count": ((ref_merge["DTU_rpower"].notna()) | (ref_merge["OSM_rpower"].notna())).sum(),
-    })
-    ref_merge.to_file(os.path.join(config.output_dir, "DTU_OSM_merge.gpkg"), driver="GPKG")
-
-    # helper to attach ref fields
-    def attach_ref_fields(gdf):
-        temp = gpd.sjoin_nearest(gdf, ref_merge, how="left", max_distance=config.join_distance)
-        temp["hubheight"] = temp["DTU_hubheight"].fillna(temp["OSM_hubheight"])
-        temp["diameter"] = temp["DTU_diameter"].fillna(temp["OSM_diameter"])
-        temp["rpower"] = temp["DTU_rpower"].fillna(temp["OSM_rpower"])
-        temp["model"] = temp["OSM_model"]
-        temp["cdate"] = temp["DTU_cdate"]
-        return temp.drop(columns=["index_right"], errors="ignore")
-
-    # 4) complete_new & complete_all
-    for ds in config.dataset_types:
-        files = glob(os.path.join(config.turbines_dir, f"**/*{ds}.shp"), recursive=True)
-        all_gdfs = []
-        for f in files:
-            g = gpd.read_file(f)
-            if g.crs is None:
-                g.set_crs(epsg=config.crs_input_default, inplace=True)
-            all_gdfs.append(g.to_crs(epsg=config.crs_target))
-        gdf = (
-            pd.concat(all_gdfs, ignore_index=True)
-            if all_gdfs
-            else gpd.GeoDataFrame(geometry=[], crs=f"EPSG:{config.crs_target}")
-        )
-        gdf = gpd.GeoDataFrame(gdf, crs=gdf.crs)
-        processed = attach_ref_fields(gdf)
-        processed = remove_duplicate_geometries(processed)
-        out = os.path.join(config.output_dir, f"complete_{ds}.gpkg")
-        processed.to_file(out, driver="GPKG")
-        stats.append({
-            "dataset": f"complete_{ds}",
-            "count_before_dedup": len(gdf),
-            "count_after_dedup": len(processed),
-            "rpower_count": processed["rpower"].notna().sum(),
-        })
-
-    # 5) complete_old = all - new
-    all_g = gpd.read_file(os.path.join(config.output_dir, "complete_all.gpkg"))
-    new_g = gpd.read_file(os.path.join(config.output_dir, "complete_new.gpkg"))
-    diff = gpd.sjoin_nearest(all_g, new_g, how="left", max_distance=config.old_distance_threshold)
-    old_pre = diff[diff["index_right"].isna()].drop(columns=["index_right"], errors="ignore")
-    old_pre = attach_ref_fields(old_pre)
-    old = remove_duplicate_geometries(old_pre)
-    old.to_file(os.path.join(config.output_dir, "complete_old.gpkg"), driver="GPKG")
-    stats.append({
-        "dataset": "complete_old",
-        "count_before_dedup": len(old_pre),
-        "count_after_dedup": len(old),
-        "rpower_count": old["rpower"].notna().sum(),
-    })
-
-    # 6) offshore from ref_merge
-    ocean = gpd.read_file("data/REGIONS/OCEAN.gpkg").to_crs(epsg=config.crs_target)
-    off = ref_merge[ref_merge.geometry.intersects(ocean.geometry.union_all())].copy()
-    off = remove_duplicate_geometries(off)
-    off.to_file(os.path.join(config.output_dir, "complete_offshore.gpkg"), driver="GPKG")
-    stats.append({
-        "dataset": "complete_offshore",
-        "count_before_dedup": len(ref_merge),
-        "count_after_dedup": len(off),
-        "rpower_count": off["rpower"].notna().sum(),
-    })
-
-    # 7) other-country from ref_merge
-    nuts = gpd.read_file("data/REGIONS/NUTS.gpkg").to_crs(epsg=config.crs_target)
-    nuts3 = nuts.dissolve(by="ICC").reset_index()
-    existing = pd.concat([all_g, new_g, old], ignore_index=True)
-    j = gpd.sjoin(nuts3, existing, how="left", predicate="intersects")
-    others = nuts3[j["index_right"].isna()].drop(columns=["index_right"], errors="ignore")
-    buf = others.geometry.buffer(100)
-    union_buf = gpd.GeoSeries(buf).union_all()
-    other = ref_merge[ref_merge.geometry.within(union_buf)].copy()
-    other = remove_duplicate_geometries(other)
-    other.to_file(os.path.join(config.output_dir, "complete_other.gpkg"), driver="GPKG")
-    stats.append({
-        "dataset": "complete_other",
-        "count_before_dedup": len(ref_merge),
-        "count_after_dedup": len(other),
-        "rpower_count": other["rpower"].notna().sum(),
-    })
-
-    # 8) write stats CSV
-    pd.DataFrame(stats).to_csv(os.path.join(config.output_dir, "processing_stats.csv"), index=False)
+            process_gpkg(country, ds, gdf_turb, polys)
+            process_xls(country, ds, polys, lookup, gdf_turb)
+        except Exception as err:
+            print(f"Error processing country {country}, dataset {ds}: {err}")
+            continue
 
 
 def main():
-    config = tyro.cli(Config)
-    process_turbines(config)
+    args = parse_args()
+    override = args.countries.split(",") if args.countries else None
+    countries = get_countries(INPUT_DIR, override)
+    if not countries:
+        print(f"No countries found in '{INPUT_DIR}'. Exiting.")
+        return
+    lookup = load_clc_lookup(CLC_LOOKUP)
+    for country in tqdm(countries, desc="Countries"):
+        process_country(country, args, lookup)
+    # After processing all, report skipped datasets
+    if skipped_datasets:
+        print("Skipped the following country-dataset combinations due to missing input:")
+        for entry in skipped_datasets:
+            print(f" - {entry}")
 
 
 if __name__ == "__main__":
